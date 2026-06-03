@@ -1,0 +1,43 @@
+[reviewer]
+name = "Prism Bot"
+language = "en"
+tone = "direct and constructive"
+
+[rules.must_have]
+items = [
+    "Every function must have a descriptive comment",
+    "Errors must always be handled, never ignored",
+    "No variable named temp, data, test, buf or foo",
+    "Functions must not exceed 40 lines",
+    "Every exported function must have a godoc comment",
+]
+
+[rules.forbidden]
+items = [
+    "No unwrap() without a comment explaining why it is safe",
+    "No hardcoded secrets, API keys or passwords",
+    "No debug print statements in production code",
+    "No empty error handling blocks",
+    "No commented-out code left in the codebase",
+]
+
+[rules.security]
+items = [
+    "User inputs must always be validated and sanitized",
+    "SQL queries must use prepared statements",
+    "No sensitive data written to logs",
+    "Dependencies must be pinned to a specific version",
+]
+
+[rules.performance]
+items = [
+    "Avoid unnecessary memory allocations inside loops",
+    "Avoid N+1 database queries",
+    "Prefer streaming over loading large datasets in memory",
+]
+
+[behavior]
+block_on_critical = true
+suggest_fixes = true
+praise_good_code = true
+max_diff_lines = 10000
