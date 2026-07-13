@@ -22,7 +22,7 @@ func main() {
 		log.Fatalf("❌ Failed to load config: %v", err)
 	}
 
-	fmt.Printf("✅ Prism started — reviewer: %s\n", cfg.Reviewer.Name)
+	fmt.Printf("Prism started - reviewer: %s\n", cfg.Reviewer.Name)
 
 	// Routes
 	mux := http.NewServeMux()

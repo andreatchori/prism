@@ -1,10 +1,15 @@
 package platforms
 
 import (
+	"crypto/hmac"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strings"
 
 	"github.com/andreatchori/prism/internal/config"
 	"github.com/andreatchori/prism/internal/reviewer"
@@ -28,23 +33,68 @@ func WebhookHandler(cfg *config.Config) http.HandlerFunc {
 		}
 		defer r.Body.Close()
 
-		var payload map[string]interface{}
-		if err := json.Unmarshal(body, &payload); err != nil {
-			http.Error(w, "invalid JSON", http.StatusBadRequest)
-			return
-		}
-
-		// Detect platform from headers
 		platform := detectPlatform(r.Header)
-		log.Printf("📥 Webhook received from: %s", platform)
+		log.Printf("Webhook received from: %s", platform)
 
 		switch platform {
 		case "github":
-			handleGitHub(w, r, payload, cfg)
+			if !verifyGitHubSignature(body, r.Header.Get("X-Hub-Signature-256")) {
+				log.Printf("Invalid GitHub webhook signature")
+				http.Error(w, "invalid signature", http.StatusUnauthorized)
+				return
+			}
+
+			var payload map[string]interface{}
+			if err := json.Unmarshal(body, &payload); err != nil {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			handleGitHub(w, payload, cfg)
+
 		case "gitlab":
-			handleGitLab(w, r, payload, cfg)
+			if !verifyGitLabToken(r.Header.Get("X-Gitlab-Token")) {
+				log.Printf("Invalid GitLab webhook token")
+				http.Error(w, "invalid token", http.StatusUnauthorized)
+				return
+			}
+
+			var payload map[string]interface{}
+			if err := json.Unmarshal(body, &payload); err != nil {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			handleGitLab(w, payload, cfg)
+
+		case "azure":
+			if !verifyAzureBasicAuth(r.Header.Get("Authorization")) {
+				log.Printf("Invalid Azure DevOps webhook auth")
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+
+			var payload map[string]interface{}
+			if err := json.Unmarshal(body, &payload); err != nil {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			handleAzure(w, payload, cfg)
+
+		case "bitbucket":
+			if !verifyBitbucketSignature(body, r.Header.Get("X-Hub-Signature")) {
+				log.Printf("Invalid Bitbucket webhook signature")
+				http.Error(w, "invalid signature", http.StatusUnauthorized)
+				return
+			}
+
+			var payload map[string]interface{}
+			if err := json.Unmarshal(body, &payload); err != nil {
+				http.Error(w, "invalid JSON", http.StatusBadRequest)
+				return
+			}
+			handleBitbucket(w, r.Header.Get("X-Event-Key"), payload, cfg)
+
 		default:
-			log.Printf("⚠️  Unknown platform: %s", platform)
+			log.Printf("Unknown platform: %s", platform)
 			http.Error(w, "unsupported platform", http.StatusBadRequest)
 		}
 	}
@@ -66,34 +116,261 @@ func detectPlatform(headers http.Header) string {
 	return "unknown"
 }
 
-func handleGitHub(w http.ResponseWriter, r *http.Request, payload map[string]interface{}, cfg *config.Config) {
-	// Extract basic PR info from payload
-	pr := PullRequest{Platform: "github"}
-
-	if action, ok := payload["action"].(string); ok {
-		if action != "opened" && action != "synchronize" {
-			w.WriteHeader(http.StatusOK)
-			return
-		}
+// verifyGitHubSignature checks X-Hub-Signature-256 when GITHUB_WEBHOOK_SECRET is set.
+// If the secret is empty, verification is skipped (local/dev mode).
+func verifyGitHubSignature(body []byte, signatureHeader string) bool {
+	secret := os.Getenv("GITHUB_WEBHOOK_SECRET")
+	if secret == "" {
+		return true
 	}
-
-	// TODO: fetch actual diff via GitHub API
-	pr.Diff = "[diff will be fetched here]"
-	pr.Title = "PR Title"
-
-	review, err := reviewer.Review(pr.Diff, cfg)
+	if !strings.HasPrefix(signatureHeader, "sha256=") {
+		return false
+	}
+	expected, err := hex.DecodeString(strings.TrimPrefix(signatureHeader, "sha256="))
 	if err != nil {
-		log.Printf("❌ Review failed: %v", err)
-		http.Error(w, "review failed", http.StatusInternalServerError)
+		return false
+	}
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write(body)
+	return hmac.Equal(mac.Sum(nil), expected)
+}
+
+func handleGitHub(w http.ResponseWriter, payload map[string]interface{}, cfg *config.Config) {
+	action, _ := payload["action"].(string)
+	if action != "opened" && action != "synchronize" {
+		w.WriteHeader(http.StatusOK)
 		return
 	}
 
-	log.Printf("✅ Review completed for GitHub PR:\n%s", review)
-	w.WriteHeader(http.StatusOK)
+	owner, repo, prNumber, sha, err := ExtractPRInfo(payload)
+	if err != nil {
+		log.Printf("Failed to extract PR info: %v", err)
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Accepted PR #%d on %s/%s (sha:%s) - reviewing in background", prNumber, owner, repo, sha)
+
+	// Acknowledge quickly so GitHub does not time out while Ollama runs
+	w.WriteHeader(http.StatusAccepted)
+	w.Write([]byte(`{"status":"accepted"}`))
+
+	go processGitHubReview(owner, repo, prNumber, sha, cfg)
 }
 
-func handleGitLab(w http.ResponseWriter, r *http.Request, payload map[string]interface{}, cfg *config.Config) {
-	// TODO: implement GitLab handler
-	log.Println("GitLab webhook received — coming soon")
-	w.WriteHeader(http.StatusOK)
+func processGitHubReview(owner, repo string, prNumber int, sha string, cfg *config.Config) {
+	gh := NewGitHubClient()
+
+	diff, err := gh.FetchDiff(owner, repo, prNumber)
+	if err != nil {
+		log.Printf("Failed to fetch diff for PR #%d: %v", prNumber, err)
+		return
+	}
+
+	diff = truncateDiff(diff, cfg.Behavior.MaxDiffLines)
+
+	result, err := reviewer.Review(diff, cfg)
+	if err != nil {
+		log.Printf("Review failed for PR #%d: %v", prNumber, err)
+		return
+	}
+
+	if err := gh.PostComment(owner, repo, prNumber, result.Body); err != nil {
+		log.Printf("Failed to post comment on PR #%d: %v", prNumber, err)
+	}
+
+	passed := true
+	if cfg.Behavior.BlockOnCritical && result.HasCritical {
+		passed = false
+	}
+	if err := gh.SetCommitStatus(owner, repo, sha, passed); err != nil {
+		log.Printf("Failed to set commit status for PR #%d: %v", prNumber, err)
+	}
+
+	log.Printf("Review finished for PR #%d (critical=%v, passed=%v)", prNumber, result.HasCritical, passed)
+}
+
+// truncateDiff limits the diff to maxLines (approximate). If maxLines <= 0, no truncation.
+func truncateDiff(diff string, maxLines int) string {
+	if maxLines <= 0 {
+		return diff
+	}
+	lines := strings.Split(diff, "\n")
+	if len(lines) <= maxLines {
+		return diff
+	}
+	log.Printf("Diff truncated from %d to %d lines", len(lines), maxLines)
+	return strings.Join(lines[:maxLines], "\n")
+}
+
+func handleGitLab(w http.ResponseWriter, payload map[string]interface{}, cfg *config.Config) {
+	kind, _ := payload["object_kind"].(string)
+	if kind != "" && kind != "merge_request" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	attrs, _ := payload["object_attributes"].(map[string]interface{})
+	action, _ := attrs["action"].(string)
+	if action != "open" && action != "update" && action != "reopen" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	projectID, mrIID, sha, err := ExtractMRInfo(payload)
+	if err != nil {
+		log.Printf("Failed to extract MR info: %v", err)
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Accepted GitLab MR !%d on %s (sha:%s) - reviewing in background", mrIID, projectID, sha)
+
+	w.WriteHeader(http.StatusAccepted)
+	w.Write([]byte(`{"status":"accepted"}`))
+
+	go processGitLabReview(projectID, mrIID, sha, cfg)
+}
+
+func processGitLabReview(projectID string, mrIID int, sha string, cfg *config.Config) {
+	gl := NewGitLabClient()
+
+	diff, err := gl.FetchDiff(projectID, mrIID)
+	if err != nil {
+		log.Printf("Failed to fetch diff for MR !%d: %v", mrIID, err)
+		return
+	}
+
+	diff = truncateDiff(diff, cfg.Behavior.MaxDiffLines)
+
+	result, err := reviewer.Review(diff, cfg)
+	if err != nil {
+		log.Printf("Review failed for MR !%d: %v", mrIID, err)
+		return
+	}
+
+	if err := gl.PostComment(projectID, mrIID, result.Body); err != nil {
+		log.Printf("Failed to post comment on MR !%d: %v", mrIID, err)
+	}
+
+	passed := true
+	if cfg.Behavior.BlockOnCritical && result.HasCritical {
+		passed = false
+	}
+	if err := gl.SetCommitStatus(projectID, sha, passed); err != nil {
+		log.Printf("Failed to set commit status for MR !%d: %v", mrIID, err)
+	}
+
+	log.Printf("Review finished for MR !%d (critical=%v, passed=%v)", mrIID, result.HasCritical, passed)
+}
+
+func handleAzure(w http.ResponseWriter, payload map[string]interface{}, cfg *config.Config) {
+	eventType, _ := payload["eventType"].(string)
+	if eventType != "" &&
+		eventType != "git.pullrequest.created" &&
+		eventType != "git.pullrequest.updated" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	org, project, repoID, prID, err := ExtractAzurePRInfo(payload)
+	if err != nil {
+		log.Printf("Failed to extract Azure PR info: %v", err)
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Accepted Azure DevOps PR #%d on %s/%s (repo:%s) - reviewing in background", prID, org, project, repoID)
+
+	w.WriteHeader(http.StatusAccepted)
+	w.Write([]byte(`{"status":"accepted"}`))
+
+	go processAzureReview(org, project, repoID, prID, cfg)
+}
+
+func processAzureReview(org, project, repoID string, prID int, cfg *config.Config) {
+	az := NewAzureClient()
+
+	diff, err := az.FetchDiff(org, project, repoID, prID)
+	if err != nil {
+		log.Printf("Failed to fetch Azure diff for PR #%d: %v", prID, err)
+		return
+	}
+
+	diff = truncateDiff(diff, cfg.Behavior.MaxDiffLines)
+
+	result, err := reviewer.Review(diff, cfg)
+	if err != nil {
+		log.Printf("Review failed for Azure PR #%d: %v", prID, err)
+		return
+	}
+
+	if err := az.PostComment(org, project, repoID, prID, result.Body); err != nil {
+		log.Printf("Failed to post comment on Azure PR #%d: %v", prID, err)
+	}
+
+	passed := true
+	if cfg.Behavior.BlockOnCritical && result.HasCritical {
+		passed = false
+	}
+	if err := az.SetPRStatus(org, project, repoID, prID, passed); err != nil {
+		log.Printf("Failed to set Azure PR status for #%d: %v", prID, err)
+	}
+
+	log.Printf("Review finished for Azure PR #%d (critical=%v, passed=%v)", prID, result.HasCritical, passed)
+}
+
+func handleBitbucket(w http.ResponseWriter, eventKey string, payload map[string]interface{}, cfg *config.Config) {
+	if eventKey != "" &&
+		eventKey != "pullrequest:created" &&
+		eventKey != "pullrequest:updated" {
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	workspace, repoSlug, prID, sha, err := ExtractBitbucketPRInfo(payload)
+	if err != nil {
+		log.Printf("Failed to extract Bitbucket PR info: %v", err)
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	log.Printf("Accepted Bitbucket PR #%d on %s/%s (sha:%s) - reviewing in background", prID, workspace, repoSlug, sha)
+
+	w.WriteHeader(http.StatusAccepted)
+	w.Write([]byte(`{"status":"accepted"}`))
+
+	go processBitbucketReview(workspace, repoSlug, prID, sha, cfg)
+}
+
+func processBitbucketReview(workspace, repoSlug string, prID int, sha string, cfg *config.Config) {
+	bb := NewBitbucketClient()
+
+	diff, err := bb.FetchDiff(workspace, repoSlug, prID)
+	if err != nil {
+		log.Printf("Failed to fetch Bitbucket diff for PR #%d: %v", prID, err)
+		return
+	}
+
+	diff = truncateDiff(diff, cfg.Behavior.MaxDiffLines)
+
+	result, err := reviewer.Review(diff, cfg)
+	if err != nil {
+		log.Printf("Review failed for Bitbucket PR #%d: %v", prID, err)
+		return
+	}
+
+	if err := bb.PostComment(workspace, repoSlug, prID, result.Body); err != nil {
+		log.Printf("Failed to post comment on Bitbucket PR #%d: %v", prID, err)
+	}
+
+	passed := true
+	if cfg.Behavior.BlockOnCritical && result.HasCritical {
+		passed = false
+	}
+	if err := bb.SetCommitStatus(workspace, repoSlug, sha, passed); err != nil {
+		log.Printf("Failed to set Bitbucket status for PR #%d: %v", prID, err)
+	}
+
+	log.Printf("Review finished for Bitbucket PR #%d (critical=%v, passed=%v)", prID, result.HasCritical, passed)
 }

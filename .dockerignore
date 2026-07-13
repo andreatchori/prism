@@ -1,0 +1,9 @@
+.git
+.gitignore
+*.md
+docs/
+rust/
+LICENSE
+*_test.go
+.env
+.env.example

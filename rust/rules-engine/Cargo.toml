@@ -1,0 +1,12 @@
+[package]
+name = "rules-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Deterministic rules evaluation for Prism"
+
+[dependencies]
+diff-parser = { path = "../diff-parser" }
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
+regex = "1"

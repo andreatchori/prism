@@ -1,0 +1,15 @@
+[package]
+name = "prism-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Local Prism review CLI (check before push)"
+
+[[bin]]
+name = "prism"
+path = "src/main.rs"
+
+[dependencies]
+diff-parser = { path = "../diff-parser" }
+rules-engine = { path = "../rules-engine" }
+clap = { version = "4", features = ["derive"] }
