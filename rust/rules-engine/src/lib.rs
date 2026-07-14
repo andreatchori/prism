@@ -5,7 +5,7 @@
 
 use diff_parser::Diff;
 use regex::Regex;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::fs;
 use std::path::Path;
@@ -81,14 +81,15 @@ impl Default for Behavior {
 }
 
 /// Severity of a rule finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Severity {
     Critical,
     Warning,
 }
 
 /// A single rule violation found in the diff.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Finding {
     pub severity: Severity,
     pub category: String,
@@ -99,7 +100,7 @@ pub struct Finding {
 }
 
 /// Result of evaluating rules against a diff.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct Evaluation {
     pub findings: Vec<Finding>,
 }

@@ -2,8 +2,9 @@
 
 use clap::{Parser, Subcommand};
 use diff_parser::parse;
-use rules_engine::{evaluate, load_config};
-use std::io::{self, Read};
+use rules_engine::{evaluate, load_config, Evaluation};
+use serde::Serialize;
+use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode};
 
 #[derive(Parser)]
@@ -28,7 +29,22 @@ enum Commands {
         /// Diff staged changes only (`git diff --cached`)
         #[arg(long)]
         staged: bool,
+
+        /// Emit machine-readable JSON on stdout (for Go server integration)
+        #[arg(long)]
+        json: bool,
     },
+}
+
+#[derive(Serialize)]
+struct JsonReport {
+    files: usize,
+    added_lines: usize,
+    removed_lines: usize,
+    has_critical: bool,
+    critical_count: usize,
+    warning_count: usize,
+    findings: Vec<rules_engine::Finding>,
 }
 
 fn main() -> ExitCode {
@@ -38,11 +54,12 @@ fn main() -> ExitCode {
             config,
             stdin,
             staged,
-        } => run_check(&config, stdin, staged),
+            json,
+        } => run_check(&config, stdin, staged, json),
     }
 }
 
-fn run_check(config_path: &str, from_stdin: bool, staged: bool) -> ExitCode {
+fn run_check(config_path: &str, from_stdin: bool, staged: bool, json: bool) -> ExitCode {
     let cfg = match load_config(config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -69,7 +86,23 @@ fn run_check(config_path: &str, from_stdin: bool, staged: bool) -> ExitCode {
     };
 
     if raw.trim().is_empty() {
-        println!("No changes to review.");
+        if json {
+            let empty = JsonReport {
+                files: 0,
+                added_lines: 0,
+                removed_lines: 0,
+                has_critical: false,
+                critical_count: 0,
+                warning_count: 0,
+                findings: Vec::new(),
+            };
+            if let Err(e) = print_json(&empty) {
+                eprintln!("Failed to write JSON: {e}");
+                return ExitCode::from(2);
+            }
+        } else {
+            println!("No changes to review.");
+        }
         return ExitCode::SUCCESS;
     }
 
@@ -81,6 +114,26 @@ fn run_check(config_path: &str, from_stdin: bool, staged: bool) -> ExitCode {
         }
     };
 
+    let result = evaluate(&diff, &cfg);
+
+    if json {
+        let report = JsonReport {
+            files: diff.files.len(),
+            added_lines: diff.added_lines(),
+            removed_lines: diff.removed_lines(),
+            has_critical: result.has_critical(),
+            critical_count: result.critical_count(),
+            warning_count: result.warning_count(),
+            findings: result.findings.clone(),
+        };
+        if let Err(e) = print_json(&report) {
+            eprintln!("Failed to write JSON: {e}");
+            return ExitCode::from(2);
+        }
+        // Always exit 0 in JSON mode so callers can rely on stdout parsing
+        return ExitCode::SUCCESS;
+    }
+
     println!(
         "Prism check - {} file(s), +{} / -{} lines",
         diff.files.len(),
@@ -88,11 +141,20 @@ fn run_check(config_path: &str, from_stdin: bool, staged: bool) -> ExitCode {
         diff.removed_lines()
     );
 
-    let result = evaluate(&diff, &cfg);
+    print_human(&result);
 
+    if cfg.behavior.block_on_critical && result.has_critical() {
+        eprintln!("Blocked: critical issues found.");
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    }
+}
+
+fn print_human(result: &Evaluation) {
     if result.findings.is_empty() {
         println!("No rule violations found.");
-        return ExitCode::SUCCESS;
+        return;
     }
 
     for f in &result.findings {
@@ -113,13 +175,13 @@ fn run_check(config_path: &str, from_stdin: bool, staged: bool) -> ExitCode {
         result.critical_count(),
         result.warning_count()
     );
+}
 
-    if cfg.behavior.block_on_critical && result.has_critical() {
-        eprintln!("Blocked: critical issues found.");
-        ExitCode::from(1)
-    } else {
-        ExitCode::SUCCESS
-    }
+fn print_json(report: &JsonReport) -> io::Result<()> {
+    let mut out = io::stdout().lock();
+    serde_json::to_writer(&mut out, report).map_err(io::Error::other)?;
+    out.write_all(b"\n")?;
+    Ok(())
 }
 
 fn git_diff(staged: bool) -> Result<String, String> {

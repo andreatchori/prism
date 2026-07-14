@@ -148,6 +148,7 @@ Prism listens on port `8080`. Ollama is available at `http://localhost:11434`.
 | `BITBUCKET_APP_PASSWORD` | - | Bitbucket app password |
 | `BITBUCKET_TOKEN` | - | Optional OAuth/Bearer token (alternative auth) |
 | `BITBUCKET_WEBHOOK_SECRET` | - | Optional; enables HMAC signature check |
+| `PRISM_ENGINE` | auto-detect | Path to Rust `prism` CLI (`check --json`); if unset, tries `rust/target/release/prism` |
 
 ### Webhooks
 
@@ -174,6 +175,20 @@ git diff | ./target/release/prism check --stdin --config ../config/examples/rule
 ```
 
 Exit code `1` if `block_on_critical` is enabled and critical findings exist.
+
+The Go server also invokes this CLI (when available) **before** Ollama:
+
+1. Deterministic Rust rules on the diff (`prism check --stdin --json`)
+2. Ollama review, with those findings injected into the prompt
+3. Combined PR comment (engine section + LLM section)
+
+Build the engine for the server:
+
+```bash
+cd rust && cargo build --release
+# optional explicit path:
+export PRISM_ENGINE="$(pwd)/target/release/prism"   # .exe on Windows
+```
 
 ## Contributing
 

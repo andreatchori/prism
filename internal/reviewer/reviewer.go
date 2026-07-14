@@ -2,9 +2,12 @@ package reviewer
 
 import (
 	"fmt"
+	"log"
+	"os"
 	"strings"
 
 	"github.com/andreatchori/prism/internal/config"
+	"github.com/andreatchori/prism/internal/engine"
 	"github.com/andreatchori/prism/internal/llm"
 )
 
@@ -14,18 +17,65 @@ type Result struct {
 	HasCritical bool
 }
 
-// Review builds the prompt from the config rules and calls Ollama
+// Review runs the Rust deterministic engine first, then Ollama for deeper analysis.
 func Review(diff string, cfg *config.Config) (*Result, error) {
-	prompt := buildPrompt(diff, cfg)
-	body, err := llm.Analyze(prompt)
+	configPath := os.Getenv("PRISM_CONFIG")
+	if configPath == "" {
+		configPath = "config/examples/rules.toml"
+	}
+
+	var engineReport *engine.Report
+	if engine.Available() {
+		report, err := engine.AnalyzeDiff(diff, configPath)
+		if err != nil {
+			log.Printf("Rust engine error (continuing with LLM only): %v", err)
+		} else {
+			engineReport = report
+			log.Printf(
+				"Rust engine: %d finding(s) (%d critical, %d warning)",
+				len(report.Findings),
+				report.CriticalCount,
+				report.WarningCount,
+			)
+		}
+	} else {
+		log.Printf("Rust engine not available - LLM-only review (set PRISM_ENGINE to enable)")
+	}
+
+	prompt := buildPrompt(diff, cfg, engineReport)
+	llmBody, err := llm.Analyze(prompt)
 	if err != nil {
+		// If LLM fails but we have deterministic findings, still return them
+		if engineReport != nil && len(engineReport.Findings) > 0 {
+			body := engine.FormatMarkdown(engineReport)
+			body += "\n\nPRISM_VERDICT: FAIL\n"
+			return &Result{Body: body, HasCritical: engineReport.HasCritical}, nil
+		}
 		return nil, err
+	}
+
+	body := mergeBodies(engine.FormatMarkdown(engineReport), llmBody)
+	hasCritical := HasCriticalIssues(llmBody)
+	if engineReport != nil && engineReport.HasCritical {
+		hasCritical = true
 	}
 
 	return &Result{
 		Body:        body,
-		HasCritical: HasCriticalIssues(body),
+		HasCritical: hasCritical,
 	}, nil
+}
+
+func mergeBodies(engineSection, llmBody string) string {
+	engineSection = strings.TrimSpace(engineSection)
+	llmBody = strings.TrimSpace(llmBody)
+	if engineSection == "" {
+		return llmBody
+	}
+	if llmBody == "" {
+		return engineSection
+	}
+	return engineSection + "\n\n---\n\n### LLM review (Ollama)\n\n" + llmBody
 }
 
 // HasCriticalIssues reports whether the model marked the review as FAIL.
@@ -42,7 +92,7 @@ func HasCriticalIssues(body string) bool {
 		!strings.Contains(strings.ToLower(body), "no critical")
 }
 
-func buildPrompt(diff string, cfg *config.Config) string {
+func buildPrompt(diff string, cfg *config.Config, engineReport *engine.Report) string {
 	mustHave := strings.Join(cfg.Rules.MustHave.Items, "\n- ")
 	forbidden := strings.Join(cfg.Rules.Forbidden.Items, "\n- ")
 	security := strings.Join(cfg.Rules.Security.Items, "\n- ")
@@ -62,6 +112,16 @@ func buildPrompt(diff string, cfg *config.Config) string {
 	}
 	instructions = append(instructions, "Be concise and actionable")
 
+	engineHint := "No deterministic findings were pre-reported."
+	if engineReport != nil && len(engineReport.Findings) > 0 {
+		engineHint = fmt.Sprintf(
+			"A deterministic rules engine already found %d issue(s) (%d critical). Confirm them, do not contradict clear matches, and focus on anything it may have missed.\n\n%s",
+			len(engineReport.Findings),
+			engineReport.CriticalCount,
+			engine.FormatMarkdown(engineReport),
+		)
+	}
+
 	return fmt.Sprintf(`
 You are %s, a code reviewer with a %s tone.
 Respond in %s.
@@ -80,6 +140,9 @@ Respond in %s.
 
 ## Instructions
 - %s
+
+## Pre-computed deterministic findings
+%s
 
 ---
 Here is the Pull Request diff to review:
@@ -105,6 +168,7 @@ PRISM_VERDICT: FAIL
 		security,
 		performance,
 		strings.Join(instructions, "\n- "),
+		engineHint,
 		diff,
 	)
 }
