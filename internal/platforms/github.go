@@ -49,7 +49,7 @@ func NewGitHubClient() *GitHubClient {
 	return &GitHubClient{
 		token:   os.Getenv("GITHUB_TOKEN"),
 		baseURL: strings.TrimRight(base, "/"),
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client:  newHTTPClient(30 * time.Second),
 	}
 }
 

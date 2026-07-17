@@ -41,7 +41,7 @@ func NewGitLabClient() *GitLabClient {
 	return &GitLabClient{
 		token:   os.Getenv("GITLAB_TOKEN"),
 		baseURL: strings.TrimRight(base, "/"),
-		client:  &http.Client{Timeout: 30 * time.Second},
+		client:  newHTTPClient(30 * time.Second),
 	}
 }
 

@@ -1,7 +1,7 @@
 package platforms
 
 import (
-	"log"
+	"log/slog"
 	"os"
 	"strconv"
 	"sync"
@@ -41,7 +41,7 @@ func runReview(key string, fn func()) {
 	inFlightMu.Lock()
 	if inFlight[key] {
 		inFlightMu.Unlock()
-		log.Printf("Review already in progress for %s, skipping duplicate webhook", key)
+		slog.Info("review already in progress, skipping duplicate webhook", "pr", key)
 		return
 	}
 	inFlight[key] = true
@@ -57,7 +57,7 @@ func runReview(key string, fn func()) {
 		}()
 		defer func() {
 			if r := recover(); r != nil {
-				log.Printf("Recovered from panic during review %s: %v", key, r)
+				slog.Error("recovered from panic during review", "pr", key, "panic", r)
 			}
 		}()
 
@@ -80,6 +80,6 @@ func WaitForReviews(timeout time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		log.Printf("Timed out waiting for in-flight reviews to finish")
+		slog.Warn("timed out waiting for in-flight reviews to finish")
 	}
 }

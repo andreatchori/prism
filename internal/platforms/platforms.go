@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -41,7 +42,14 @@ func WebhookHandler(cfg *config.Config) http.HandlerFunc {
 		defer r.Body.Close()
 
 		platform := detectPlatform(r.Header)
-		log.Printf("Webhook received from: %s", platform)
+		slog.Info("webhook received", "platform", platform)
+
+		if platform != "unknown" && isDuplicateDelivery(platform, r.Header) {
+			slog.Info("duplicate webhook delivery ignored", "platform", platform)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"status":"duplicate"}`))
+			return
+		}
 
 		switch platform {
 		case "github":
@@ -250,6 +258,18 @@ func inlineCommentsFromSuggestions(suggestions []reviewer.Suggestion) []InlineCo
 	return out
 }
 
+// degradedSuggestionBody renders a suggestion as an inline comment with a plain
+// (non-applicable) code block, for platforms without native one-click suggestions.
+func degradedSuggestionBody(s reviewer.Suggestion) string {
+	code := strings.TrimRight(s.Code, "\n")
+	body := prismInlineMarker + "\n**Prism suggestion** (rule-based)"
+	if r := strings.TrimSpace(s.Rationale); r != "" {
+		body += ": " + r
+	}
+	body += fmt.Sprintf("\n\n```\n%s\n```", code)
+	return body
+}
+
 // truncateDiff limits the diff to maxLines (approximate). If maxLines <= 0, no truncation.
 func truncateDiff(diff string, maxLines int) string {
 	if maxLines <= 0 {
@@ -380,6 +400,12 @@ func processAzureReview(org, project, repoID string, prID int, cfg *config.Confi
 		log.Printf("Failed to post comment on Azure PR #%d: %v", prID, err)
 	}
 
+	if cfg.Behavior.ProposeChanges && len(result.Suggestions) > 0 {
+		if err := az.PostSuggestions(org, project, repoID, prID, result.Suggestions); err != nil {
+			log.Printf("Failed to post inline suggestions on Azure PR #%d: %v", prID, err)
+		}
+	}
+
 	passed := true
 	if cfg.Behavior.BlockOnCritical && result.HasCritical {
 		passed = false
@@ -434,6 +460,12 @@ func processBitbucketReview(workspace, repoSlug string, prID int, sha string, cf
 
 	if err := bb.PostComment(workspace, repoSlug, prID, result.Body); err != nil {
 		log.Printf("Failed to post comment on Bitbucket PR #%d: %v", prID, err)
+	}
+
+	if cfg.Behavior.ProposeChanges && len(result.Suggestions) > 0 {
+		if err := bb.PostSuggestions(workspace, repoSlug, prID, result.Suggestions); err != nil {
+			log.Printf("Failed to post inline suggestions on Bitbucket PR #%d: %v", prID, err)
+		}
 	}
 
 	passed := true

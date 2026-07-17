@@ -13,6 +13,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/andreatchori/prism/internal/reviewer"
 )
 
 type BitbucketClient struct {
@@ -27,7 +29,7 @@ func NewBitbucketClient() *BitbucketClient {
 		username: os.Getenv("BITBUCKET_USERNAME"),
 		appPass:  os.Getenv("BITBUCKET_APP_PASSWORD"),
 		token:    os.Getenv("BITBUCKET_TOKEN"),
-		client:   &http.Client{Timeout: 30 * time.Second},
+		client:   newHTTPClient(30 * time.Second),
 	}
 }
 
@@ -155,6 +157,137 @@ func (b *BitbucketClient) findPrismComment(base string) (int64, error) {
 		}
 	}
 	return 0, nil
+}
+
+// PostSuggestions posts rule-based suggestions as inline PR comments. Bitbucket
+// has no one-click apply, so the code is shown as a copyable block. Existing
+// Prism suggestion comments at the same file/line are skipped to avoid duplicates.
+func (b *BitbucketClient) PostSuggestions(workspace, repoSlug string, prID int, suggestions []reviewer.Suggestion) error {
+	if len(suggestions) == 0 {
+		return nil
+	}
+
+	base := fmt.Sprintf(
+		"https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d/comments",
+		url.PathEscape(workspace), url.PathEscape(repoSlug), prID,
+	)
+
+	existing, err := b.listPrismSuggestionComments(base)
+	if err != nil {
+		log.Printf("Could not list existing Bitbucket suggestion comments (will create new): %v", err)
+		existing = map[string]bool{}
+	}
+
+	const maxInline = 30
+	posted := 0
+	for _, s := range suggestions {
+		if posted >= maxInline {
+			break
+		}
+		if s.File == "" || s.Line == 0 || strings.TrimSpace(s.Code) == "" {
+			continue
+		}
+		key := fmt.Sprintf("%s:%d", s.File, s.Line)
+		if existing[key] {
+			continue
+		}
+
+		payload := struct {
+			Content struct {
+				Raw string `json:"raw"`
+			} `json:"content"`
+			Inline struct {
+				Path string `json:"path"`
+				To   uint   `json:"to"`
+			} `json:"inline"`
+		}{}
+		payload.Content.Raw = degradedSuggestionBody(s)
+		payload.Inline.Path = s.File
+		payload.Inline.To = s.Line
+
+		data, err := json.Marshal(payload)
+		if err != nil {
+			log.Printf("Failed to marshal Bitbucket suggestion: %v", err)
+			continue
+		}
+
+		req, err := http.NewRequest("POST", base, strings.NewReader(string(data)))
+		if err != nil {
+			log.Printf("Failed to create Bitbucket suggestion request: %v", err)
+			continue
+		}
+		b.setAuth(req)
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := b.client.Do(req)
+		if err != nil {
+			log.Printf("Failed to post Bitbucket suggestion on PR #%d (%s): %v", prID, key, err)
+			continue
+		}
+		func() {
+			defer resp.Body.Close()
+			if resp.StatusCode != http.StatusCreated && resp.StatusCode != http.StatusOK {
+				body, _ := io.ReadAll(resp.Body)
+				log.Printf("Bitbucket suggestion status %d on PR #%d (%s): %s", resp.StatusCode, prID, key, string(body))
+				return
+			}
+			posted++
+		}()
+	}
+
+	if posted > 0 {
+		log.Printf("Posted %d inline suggestion(s) on Bitbucket PR #%d", posted, prID)
+	}
+	return nil
+}
+
+// listPrismSuggestionComments returns the set of "path:line" keys already covered
+// by a Prism inline suggestion comment.
+func (b *BitbucketClient) listPrismSuggestionComments(base string) (map[string]bool, error) {
+	req, err := http.NewRequest("GET", base+"?pagelen=100", nil)
+	if err != nil {
+		return nil, err
+	}
+	b.setAuth(req)
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list comments status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var page struct {
+		Values []struct {
+			Content struct {
+				Raw string `json:"raw"`
+			} `json:"content"`
+			Deleted bool `json:"deleted"`
+			Inline  *struct {
+				Path string `json:"path"`
+				To   *uint  `json:"to"`
+			} `json:"inline"`
+		} `json:"values"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]bool)
+	for _, c := range page.Values {
+		if c.Deleted || c.Inline == nil || c.Inline.To == nil {
+			continue
+		}
+		if !strings.Contains(c.Content.Raw, prismInlineMarker) {
+			continue
+		}
+		out[fmt.Sprintf("%s:%d", c.Inline.Path, *c.Inline.To)] = true
+	}
+	return out, nil
 }
 
 // SetCommitStatus sets a build status on the head commit

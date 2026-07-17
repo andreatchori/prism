@@ -3,11 +3,12 @@ package main
 import (
 	"context"
 	"errors"
-	"fmt"
 	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -16,8 +17,7 @@ import (
 )
 
 func main() {
-	log.SetFlags(log.LstdFlags | log.LUTC)
-	log.SetPrefix("prism ")
+	setupLogging()
 
 	cfgPath := os.Getenv("PRISM_CONFIG")
 	if cfgPath == "" {
@@ -26,10 +26,11 @@ func main() {
 
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
-		log.Fatalf("Failed to load config: %v", err)
+		slog.Error("failed to load config", "error", err)
+		os.Exit(1)
 	}
 
-	fmt.Printf("Prism started - reviewer: %s\n", cfg.Reviewer.Name)
+	slog.Info("prism started", "reviewer", cfg.Reviewer.Name)
 
 	mux := http.NewServeMux()
 	mux.HandleFunc("/webhook", platforms.WebhookHandler(cfg))
@@ -52,7 +53,7 @@ func main() {
 	// Run the server in the background so we can wait for shutdown signals.
 	serverErr := make(chan error, 1)
 	go func() {
-		fmt.Printf("Listening on port %s\n", port)
+		slog.Info("listening", "port", port)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErr <- err
 		}
@@ -63,24 +64,59 @@ func main() {
 
 	select {
 	case err := <-serverErr:
-		log.Fatalf("Server error: %v", err)
+		slog.Error("server error", "error", err)
+		os.Exit(1)
 	case sig := <-stop:
-		log.Printf("Received %s, shutting down gracefully...", sig)
+		slog.Info("shutting down gracefully", "signal", sig.String())
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 
 	if err := srv.Shutdown(ctx); err != nil {
-		log.Printf("Graceful shutdown failed: %v", err)
+		slog.Warn("graceful shutdown failed", "error", err)
 		if err := srv.Close(); err != nil {
-			log.Printf("Forced close failed: %v", err)
+			slog.Error("forced close failed", "error", err)
 		}
 	}
 
 	// Give in-flight background reviews a moment to finish.
 	platforms.WaitForReviews(15 * time.Second)
-	log.Println("Prism stopped")
+	slog.Info("prism stopped")
+}
+
+// setupLogging configures slog as the default logger (also routing the standard
+// log package through it). Format is controlled by PRISM_LOG_FORMAT (text|json)
+// and level by PRISM_LOG_LEVEL (debug|info|warn|error).
+func setupLogging() {
+	level := parseLogLevel(os.Getenv("PRISM_LOG_LEVEL"))
+	opts := &slog.HandlerOptions{Level: level}
+
+	var handler slog.Handler
+	if strings.EqualFold(os.Getenv("PRISM_LOG_FORMAT"), "json") {
+		handler = slog.NewJSONHandler(os.Stdout, opts)
+	} else {
+		handler = slog.NewTextHandler(os.Stdout, opts)
+	}
+
+	logger := slog.New(handler)
+	slog.SetDefault(logger)
+	// Ensure log.* calls (used across packages) flow through slog without
+	// duplicating timestamps.
+	log.SetFlags(0)
+}
+
+func parseLogLevel(s string) slog.Level {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "debug":
+		return slog.LevelDebug
+	case "warn", "warning":
+		return slog.LevelWarn
+	case "error":
+		return slog.LevelError
+	default:
+		return slog.LevelInfo
+	}
 }
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {

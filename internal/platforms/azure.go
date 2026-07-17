@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"github.com/andreatchori/prism/internal/reviewer"
 )
 
 type AzureClient struct {
@@ -50,7 +52,7 @@ func NewAzureClient() *AzureClient {
 	return &AzureClient{
 		pat:    os.Getenv("AZURE_DEVOPS_PAT"),
 		org:    os.Getenv("AZURE_DEVOPS_ORG"),
-		client: &http.Client{Timeout: 45 * time.Second},
+		client: newHTTPClient(45 * time.Second),
 	}
 }
 
@@ -364,6 +366,168 @@ func (a *AzureClient) findPrismThread(org, project, repoID string, prID int) (in
 		}
 	}
 	return 0, 0, nil
+}
+
+// PostSuggestions posts rule-based suggestions as inline PR threads anchored to a
+// file/line. Azure DevOps has no one-click apply, so the code is shown as a
+// copyable block. Existing Prism suggestion threads at the same file/line are
+// skipped to avoid duplicates on subsequent pushes.
+func (a *AzureClient) PostSuggestions(org, project, repoID string, prID int, suggestions []reviewer.Suggestion) error {
+	if org == "" {
+		org = a.org
+	}
+	if len(suggestions) == 0 {
+		return nil
+	}
+
+	existing, err := a.listPrismSuggestionThreads(org, project, repoID, prID)
+	if err != nil {
+		log.Printf("Could not list existing Azure suggestion threads (will create new): %v", err)
+		existing = map[string]bool{}
+	}
+
+	const maxInline = 30
+	posted := 0
+	for _, s := range suggestions {
+		if posted >= maxInline {
+			break
+		}
+		if s.File == "" || s.Line == 0 || strings.TrimSpace(s.Code) == "" {
+			continue
+		}
+		filePath := ensureLeadingSlash(s.File)
+		key := fmt.Sprintf("%s:%d", filePath, s.Line)
+		if existing[key] {
+			continue
+		}
+
+		if err := a.createSuggestionThread(org, project, repoID, prID, filePath, s.Line, degradedSuggestionBody(s)); err != nil {
+			log.Printf("Failed to post Azure suggestion on PR #%d (%s): %v", prID, key, err)
+			continue
+		}
+		posted++
+	}
+
+	if posted > 0 {
+		log.Printf("Posted %d inline suggestion(s) on Azure DevOps PR #%d", posted, prID)
+	}
+	return nil
+}
+
+func (a *AzureClient) createSuggestionThread(org, project, repoID string, prID int, filePath string, line uint, content string) error {
+	endpoint := fmt.Sprintf(
+		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/pullRequests/%d/threads?api-version=7.1",
+		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), prID,
+	)
+
+	payload := struct {
+		Comments []map[string]interface{} `json:"comments"`
+		Status   int                      `json:"status"`
+		Context  map[string]interface{}   `json:"threadContext"`
+	}{
+		Comments: []map[string]interface{}{
+			{"parentCommentId": 0, "content": content, "commentType": 1},
+		},
+		Status: 1,
+		Context: map[string]interface{}{
+			"filePath":       filePath,
+			"rightFileStart": map[string]int{"line": int(line), "offset": 1},
+			"rightFileEnd":   map[string]int{"line": int(line), "offset": 1},
+		},
+	}
+	data, err := json.Marshal(payload)
+	if err != nil {
+		return err
+	}
+
+	req, err := http.NewRequest("POST", endpoint, strings.NewReader(string(data)))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", a.authHeader())
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("create suggestion thread status %d: %s", resp.StatusCode, string(body))
+	}
+	return nil
+}
+
+// listPrismSuggestionThreads returns the set of "file:line" keys already covered
+// by a Prism suggestion thread.
+func (a *AzureClient) listPrismSuggestionThreads(org, project, repoID string, prID int) (map[string]bool, error) {
+	endpoint := fmt.Sprintf(
+		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/pullRequests/%d/threads?api-version=7.1",
+		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), prID,
+	)
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", a.authHeader())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("list threads status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Value []struct {
+			Comments []struct {
+				Content string `json:"content"`
+			} `json:"comments"`
+			ThreadContext *struct {
+				FilePath       string `json:"filePath"`
+				RightFileStart *struct {
+					Line int `json:"line"`
+				} `json:"rightFileStart"`
+			} `json:"threadContext"`
+		} `json:"value"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	out := make(map[string]bool)
+	for _, thread := range result.Value {
+		if thread.ThreadContext == nil || thread.ThreadContext.RightFileStart == nil {
+			continue
+		}
+		isPrism := false
+		for _, c := range thread.Comments {
+			if strings.Contains(c.Content, prismInlineMarker) {
+				isPrism = true
+				break
+			}
+		}
+		if !isPrism {
+			continue
+		}
+		key := fmt.Sprintf("%s:%d", thread.ThreadContext.FilePath, thread.ThreadContext.RightFileStart.Line)
+		out[key] = true
+	}
+	return out, nil
+}
+
+func ensureLeadingSlash(p string) string {
+	if p == "" || strings.HasPrefix(p, "/") {
+		return p
+	}
+	return "/" + p
 }
 
 // SetPRStatus sets a pull request status

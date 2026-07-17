@@ -97,7 +97,13 @@ Supported platforms for one-click suggestions:
   existing Prism suggestions at the same file/line are updated in place rather
   than duplicated, and stale ones (no longer proposed) are automatically resolved.
 
-Azure DevOps and Bitbucket still receive the proposals inside the summary comment.
+- **Azure DevOps** & **Bitbucket** - inline comments with a copyable code block
+  (no native one-click apply); existing Prism suggestions at the same file/line
+  are skipped to avoid duplicates.
+
+Reliability: outbound API calls retry transient failures (HTTP 429/5xx) honoring
+`Retry-After`, and duplicate webhook deliveries are ignored via the provider's
+delivery id. Logging is structured (`PRISM_LOG_FORMAT=text|json`, `PRISM_LOG_LEVEL`).
 
 ## Getting Started
 

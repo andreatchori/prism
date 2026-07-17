@@ -104,6 +104,36 @@ func TestGitlabSuggestionBody(t *testing.T) {
 	}
 }
 
+func TestDegradedSuggestionBody(t *testing.T) {
+	body := degradedSuggestionBody(reviewer.Suggestion{
+		File: "main.go", Line: 5, EndLine: 5, Code: "log.Println(x)\n", Rationale: "use logger",
+	})
+	if !strings.Contains(body, prismInlineMarker) {
+		t.Errorf("expected inline marker, got %q", body)
+	}
+	if !strings.Contains(body, "```\nlog.Println(x)\n```") {
+		t.Errorf("expected plain code block, got %q", body)
+	}
+	if strings.Contains(body, "```suggestion") {
+		t.Errorf("degraded body must not use a one-click suggestion block: %q", body)
+	}
+	if !strings.Contains(body, "use logger") {
+		t.Errorf("expected rationale, got %q", body)
+	}
+}
+
+func TestEnsureLeadingSlash(t *testing.T) {
+	if got := ensureLeadingSlash("main.go"); got != "/main.go" {
+		t.Errorf("got %q, want /main.go", got)
+	}
+	if got := ensureLeadingSlash("/src/main.go"); got != "/src/main.go" {
+		t.Errorf("got %q, want unchanged", got)
+	}
+	if got := ensureLeadingSlash(""); got != "" {
+		t.Errorf("empty should stay empty, got %q", got)
+	}
+}
+
 func TestSuggestionKey(t *testing.T) {
 	if got := suggestionKey("main.go", 12); got != "main.go:12" {
 		t.Errorf("suggestionKey = %q, want main.go:12", got)
