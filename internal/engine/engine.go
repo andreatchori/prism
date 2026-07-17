@@ -23,13 +23,13 @@ type Finding struct {
 
 // Report is the JSON report produced by `prism check --json --stdin`.
 type Report struct {
-	Files          int       `json:"files"`
-	AddedLines     int       `json:"added_lines"`
-	RemovedLines   int       `json:"removed_lines"`
-	HasCritical    bool      `json:"has_critical"`
-	CriticalCount  int       `json:"critical_count"`
-	WarningCount   int       `json:"warning_count"`
-	Findings       []Finding `json:"findings"`
+	Files         int       `json:"files"`
+	AddedLines    int       `json:"added_lines"`
+	RemovedLines  int       `json:"removed_lines"`
+	HasCritical   bool      `json:"has_critical"`
+	CriticalCount int       `json:"critical_count"`
+	WarningCount  int       `json:"warning_count"`
+	Findings      []Finding `json:"findings"`
 }
 
 // Available reports whether a Rust engine binary can be located.

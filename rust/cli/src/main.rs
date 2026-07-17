@@ -8,7 +8,10 @@ use std::io::{self, Read, Write};
 use std::process::{Command, ExitCode};
 
 #[derive(Parser)]
-#[command(name = "prism", about = "Prism - self-hosted AI code review agent (local CLI)")]
+#[command(
+    name = "prism",
+    about = "Prism - self-hosted AI code review agent (local CLI)"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,

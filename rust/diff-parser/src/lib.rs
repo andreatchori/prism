@@ -24,10 +24,7 @@ impl Diff {
 
     /// All added line contents (trimmed of the leading `+`).
     pub fn added_content(&self) -> Vec<&str> {
-        self.files
-            .iter()
-            .flat_map(|f| f.added_content())
-            .collect()
+        self.files.iter().flat_map(|f| f.added_content()).collect()
     }
 }
 
@@ -141,12 +138,13 @@ pub fn parse(input: &str) -> Result<Diff, ParseError> {
         }
     };
 
-    let flush_file = |files: &mut Vec<FileDiff>, file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>| {
-        if let Some(mut f) = file.take() {
-            flush_hunk(&mut f, hunk);
-            files.push(f);
-        }
-    };
+    let flush_file =
+        |files: &mut Vec<FileDiff>, file: &mut Option<FileDiff>, hunk: &mut Option<Hunk>| {
+            if let Some(mut f) = file.take() {
+                flush_hunk(&mut f, hunk);
+                files.push(f);
+            }
+        };
 
     for raw in input.lines() {
         let line = raw.strip_suffix('\r').unwrap_or(raw);
@@ -290,10 +288,7 @@ fn parse_hunk_header(line: &str) -> Result<Hunk, ParseError> {
 
 fn parse_range(spec: &str) -> (u32, u32) {
     if let Some((start, count)) = spec.split_once(',') {
-        (
-            start.parse().unwrap_or(0),
-            count.parse().unwrap_or(1),
-        )
+        (start.parse().unwrap_or(0), count.parse().unwrap_or(1))
     } else {
         (spec.parse().unwrap_or(0), 1)
     }

@@ -231,7 +231,8 @@ fn line_matches(content: &str, rule: &str) -> bool {
     let rule_l = rule.to_lowercase();
 
     // Explicit patterns for common Prism example rules
-    if rule_l.contains("hardcoded") && (rule_l.contains("secret") || rule_l.contains("api key") || rule_l.contains("password"))
+    if rule_l.contains("hardcoded")
+        && (rule_l.contains("secret") || rule_l.contains("api key") || rule_l.contains("password"))
     {
         return looks_like_secret(&lower);
     }
@@ -293,8 +294,12 @@ fn bad_variable_name(line: &str) -> bool {
 }
 
 fn looks_like_raw_sql(line: &str) -> bool {
-    let has_sql = line.contains("select ") || line.contains("insert ") || line.contains("update ") || line.contains("delete ");
-    let looks_concat = line.contains("+") || line.contains("fmt.sprintf") || line.contains("format!(");
+    let has_sql = line.contains("select ")
+        || line.contains("insert ")
+        || line.contains("update ")
+        || line.contains("delete ");
+    let looks_concat =
+        line.contains("+") || line.contains("fmt.sprintf") || line.contains("format!(");
     has_sql && looks_concat
 }
 
