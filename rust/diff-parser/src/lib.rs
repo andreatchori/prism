@@ -161,8 +161,8 @@ pub fn parse(input: &str) -> Result<Diff, ParseError> {
             continue;
         }
 
-        if line.starts_with("--- ") {
-            let path = strip_diff_path(&line[4..]);
+        if let Some(rest) = line.strip_prefix("--- ") {
+            let path = strip_diff_path(rest);
             if current.is_none() {
                 current = Some(FileDiff {
                     old_path: path.clone(),
@@ -178,8 +178,8 @@ pub fn parse(input: &str) -> Result<Diff, ParseError> {
             continue;
         }
 
-        if line.starts_with("+++ ") {
-            let path = strip_diff_path(&line[4..]);
+        if let Some(rest) = line.strip_prefix("+++ ") {
+            let path = strip_diff_path(rest);
             if let Some(f) = current.as_mut() {
                 f.new_path = path.clone();
                 f.is_deleted = path == "/dev/null";
