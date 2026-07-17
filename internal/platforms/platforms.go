@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -12,6 +13,7 @@ import (
 	"strings"
 
 	"github.com/andreatchori/prism/internal/config"
+	"github.com/andreatchori/prism/internal/engine"
 	"github.com/andreatchori/prism/internal/reviewer"
 )
 
@@ -179,6 +181,12 @@ func processGitHubReview(owner, repo string, prNumber int, sha string, cfg *conf
 		log.Printf("Failed to post comment on PR #%d: %v", prNumber, err)
 	}
 
+	if inline := inlineCommentsFromFindings(result.Findings); len(inline) > 0 {
+		if err := gh.PostReview(owner, repo, prNumber, sha, inline); err != nil {
+			log.Printf("Failed to post inline review on PR #%d: %v", prNumber, err)
+		}
+	}
+
 	passed := true
 	if cfg.Behavior.BlockOnCritical && result.HasCritical {
 		passed = false
@@ -188,6 +196,25 @@ func processGitHubReview(owner, repo string, prNumber int, sha string, cfg *conf
 	}
 
 	log.Printf("Review finished for PR #%d (critical=%v, passed=%v)", prNumber, result.HasCritical, passed)
+}
+
+// inlineCommentsFromFindings converts engine findings that have a line number
+// into GitHub inline review comments.
+func inlineCommentsFromFindings(findings []engine.Finding) []InlineComment {
+	var out []InlineComment
+	for _, f := range findings {
+		if f.Line == nil || f.File == "" {
+			continue
+		}
+		severity := strings.ToUpper(f.Severity)
+		body := fmt.Sprintf("**Prism [%s]** (%s): %s", severity, f.Category, f.Rule)
+		out = append(out, InlineComment{
+			Path: f.File,
+			Line: *f.Line,
+			Body: body,
+		})
+	}
+	return out
 }
 
 // truncateDiff limits the diff to maxLines (approximate). If maxLines <= 0, no truncation.

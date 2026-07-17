@@ -196,6 +196,83 @@ func (g *GitHubClient) setJSONHeaders(req *http.Request) {
 	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 }
 
+// InlineComment is a single review comment tied to a file and line.
+type InlineComment struct {
+	Path string
+	Line uint
+	Body string
+}
+
+// PostReview creates a PR review with inline comments on specific lines.
+// Comments whose line is not part of the diff are silently dropped by GitHub;
+// we cap the number of inline comments to avoid overwhelming the PR.
+func (g *GitHubClient) PostReview(owner, repo string, prNumber int, sha string, comments []InlineComment) error {
+	if len(comments) == 0 {
+		return nil
+	}
+
+	const maxInline = 30
+	if len(comments) > maxInline {
+		comments = comments[:maxInline]
+	}
+
+	type ghComment struct {
+		Path string `json:"path"`
+		Line uint   `json:"line"`
+		Side string `json:"side"`
+		Body string `json:"body"`
+	}
+	type ghReview struct {
+		CommitID string      `json:"commit_id"`
+		Event    string      `json:"event"`
+		Body     string      `json:"body"`
+		Comments []ghComment `json:"comments"`
+	}
+
+	review := ghReview{
+		CommitID: sha,
+		Event:    "COMMENT",
+		Body:     "Prism inline findings",
+	}
+	for _, c := range comments {
+		review.Comments = append(review.Comments, ghComment{
+			Path: c.Path,
+			Line: c.Line,
+			Side: "RIGHT",
+			Body: c.Body,
+		})
+	}
+
+	payload, err := json.Marshal(review)
+	if err != nil {
+		return fmt.Errorf("failed to marshal review: %w", err)
+	}
+
+	url := fmt.Sprintf(
+		"https://api.github.com/repos/%s/%s/pulls/%d/reviews",
+		owner, repo, prNumber,
+	)
+	req, err := http.NewRequest("POST", url, strings.NewReader(string(payload)))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	g.setJSONHeaders(req)
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to post review: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	log.Printf("Inline review posted on PR #%d (%d comment(s))", prNumber, len(review.Comments))
+	return nil
+}
+
 // SetCommitStatus sets the commit status (success or failure) on the PR
 func (g *GitHubClient) SetCommitStatus(owner, repo, sha string, success bool) error {
 	url := fmt.Sprintf(

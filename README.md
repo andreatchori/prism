@@ -162,6 +162,8 @@ Prism listens on port `8080`. Ollama is available at `http://localhost:11434`.
 
 Prism responds with `202 Accepted` immediately and runs the review in the background (Ollama can take minutes).
 
+On GitHub, Prism posts a single summary comment (updated in place on new pushes) and, when the Rust engine is enabled, adds inline review comments on the exact lines of deterministic findings.
+
 ### Rust CLI (local check)
 
 Deterministic rules run locally before you push (no Ollama required):

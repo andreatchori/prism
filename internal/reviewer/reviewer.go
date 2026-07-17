@@ -15,6 +15,9 @@ import (
 type Result struct {
 	Body        string
 	HasCritical bool
+	// Findings are the deterministic engine findings (with file/line), usable
+	// for inline review comments. Empty when the engine is unavailable.
+	Findings []engine.Finding
 }
 
 // Review runs the Rust deterministic engine first, then Ollama for deeper analysis.
@@ -42,6 +45,11 @@ func Review(diff string, cfg *config.Config) (*Result, error) {
 		log.Printf("Rust engine not available - LLM-only review (set PRISM_ENGINE to enable)")
 	}
 
+	var findings []engine.Finding
+	if engineReport != nil {
+		findings = engineReport.Findings
+	}
+
 	prompt := buildPrompt(diff, cfg, engineReport)
 	llmBody, err := llm.Analyze(prompt)
 	if err != nil {
@@ -49,7 +57,7 @@ func Review(diff string, cfg *config.Config) (*Result, error) {
 		if engineReport != nil && len(engineReport.Findings) > 0 {
 			body := engine.FormatMarkdown(engineReport)
 			body += "\n\nPRISM_VERDICT: FAIL\n"
-			return &Result{Body: body, HasCritical: engineReport.HasCritical}, nil
+			return &Result{Body: body, HasCritical: engineReport.HasCritical, Findings: findings}, nil
 		}
 		return nil, err
 	}
@@ -63,6 +71,7 @@ func Review(diff string, cfg *config.Config) (*Result, error) {
 	return &Result{
 		Body:        body,
 		HasCritical: hasCritical,
+		Findings:    findings,
 	}, nil
 }
 

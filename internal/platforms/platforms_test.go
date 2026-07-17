@@ -8,7 +8,29 @@ import (
 	"os"
 	"strings"
 	"testing"
+
+	"github.com/andreatchori/prism/internal/engine"
 )
+
+func TestInlineCommentsFromFindings(t *testing.T) {
+	line := uint(7)
+	findings := []engine.Finding{
+		{Severity: "critical", Category: "security", Rule: "No secrets", File: "main.go", Line: &line},
+		{Severity: "warning", Category: "perf", Rule: "loop alloc", File: "util.go", Line: nil}, // dropped (no line)
+		{Severity: "critical", Category: "forbidden", Rule: "no unwrap", File: "", Line: &line}, // dropped (no file)
+	}
+
+	out := inlineCommentsFromFindings(findings)
+	if len(out) != 1 {
+		t.Fatalf("expected 1 inline comment, got %d", len(out))
+	}
+	if out[0].Path != "main.go" || out[0].Line != 7 {
+		t.Errorf("unexpected inline target: %+v", out[0])
+	}
+	if !strings.Contains(out[0].Body, "CRITICAL") || !strings.Contains(out[0].Body, "No secrets") {
+		t.Errorf("unexpected body: %q", out[0].Body)
+	}
+}
 
 func TestFormatCommentHasMarker(t *testing.T) {
 	out := formatComment("hello")
