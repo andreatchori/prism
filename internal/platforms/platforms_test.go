@@ -6,8 +6,19 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"os"
+	"strings"
 	"testing"
 )
+
+func TestFormatCommentHasMarker(t *testing.T) {
+	out := formatComment("hello")
+	if !strings.Contains(out, prismCommentMarker) {
+		t.Error("expected formatted comment to contain the hidden marker")
+	}
+	if !strings.Contains(out, "hello") {
+		t.Error("expected formatted comment to contain the review body")
+	}
+}
 
 func TestExtractPRInfo(t *testing.T) {
 	payload := map[string]interface{}{

@@ -1,6 +1,7 @@
 package platforms
 
 import (
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -8,6 +9,10 @@ import (
 	"os"
 	"strings"
 )
+
+// prismCommentMarker is an HTML comment embedded in every Prism comment so we
+// can find and update it on subsequent pushes instead of creating duplicates.
+const prismCommentMarker = "<!-- prism-review-comment -->"
 
 type GitHubClient struct {
 	token  string
@@ -68,24 +73,35 @@ func (g *GitHubClient) FetchDiff(owner, repo string, prNumber int) (string, erro
 	return string(body), nil
 }
 
-// PostComment posts the review comment on the Pull Request
+// PostComment upserts the review comment on the Pull Request: it updates the
+// existing Prism comment when present, otherwise creates a new one.
 func (g *GitHubClient) PostComment(owner, repo string, prNumber int, comment string) error {
+	formatted := formatComment(comment)
+
+	existingID, err := g.findPrismComment(owner, repo, prNumber)
+	if err != nil {
+		log.Printf("Could not look up existing Prism comment (will create new): %v", err)
+	}
+
+	if existingID != 0 {
+		return g.updateComment(owner, repo, existingID, formatted, prNumber)
+	}
+	return g.createComment(owner, repo, prNumber, formatted)
+}
+
+func (g *GitHubClient) createComment(owner, repo string, prNumber int, formatted string) error {
 	url := fmt.Sprintf(
 		"https://api.github.com/repos/%s/%s/issues/%d/comments",
 		owner, repo, prNumber,
 	)
 
-	body := fmt.Sprintf(`{"body": %q}`, formatComment(comment))
+	body := fmt.Sprintf(`{"body": %q}`, formatted)
 
 	req, err := http.NewRequest("POST", url, strings.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
-
-	req.Header.Set("Authorization", "Bearer "+g.token)
-	req.Header.Set("Accept", "application/vnd.github+json")
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	g.setJSONHeaders(req)
 
 	resp, err := g.client.Do(req)
 	if err != nil {
@@ -100,6 +116,84 @@ func (g *GitHubClient) PostComment(owner, repo string, prNumber int, comment str
 
 	log.Printf("Comment posted on PR #%d", prNumber)
 	return nil
+}
+
+func (g *GitHubClient) updateComment(owner, repo string, commentID int64, formatted string, prNumber int) error {
+	url := fmt.Sprintf(
+		"https://api.github.com/repos/%s/%s/issues/comments/%d",
+		owner, repo, commentID,
+	)
+
+	body := fmt.Sprintf(`{"body": %q}`, formatted)
+
+	req, err := http.NewRequest("PATCH", url, strings.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("failed to create request: %w", err)
+	}
+	g.setJSONHeaders(req)
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to update comment: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("GitHub API returned status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	log.Printf("Comment updated on PR #%d (id %d)", prNumber, commentID)
+	return nil
+}
+
+// findPrismComment returns the ID of an existing Prism comment, or 0 if none.
+func (g *GitHubClient) findPrismComment(owner, repo string, prNumber int) (int64, error) {
+	url := fmt.Sprintf(
+		"https://api.github.com/repos/%s/%s/issues/%d/comments?per_page=100",
+		owner, repo, prNumber,
+	)
+
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("Authorization", "Bearer "+g.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+
+	resp, err := g.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("list comments status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var comments []struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&comments); err != nil {
+		return 0, err
+	}
+
+	for _, c := range comments {
+		if strings.Contains(c.Body, prismCommentMarker) {
+			return c.ID, nil
+		}
+	}
+	return 0, nil
+}
+
+func (g *GitHubClient) setJSONHeaders(req *http.Request) {
+	req.Header.Set("Authorization", "Bearer "+g.token)
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
 }
 
 // SetCommitStatus sets the commit status (success or failure) on the PR
@@ -186,7 +280,8 @@ func ExtractPRInfo(payload map[string]interface{}) (owner, repo string, prNumber
 	return owner, repo, prNumber, sha, nil
 }
 
-// formatComment wraps the review in a nice markdown format
+// formatComment wraps the review in a nice markdown format, embedding a hidden
+// marker so the comment can be found and updated on later pushes.
 func formatComment(review string) string {
-	return fmt.Sprintf("## Prism Code Review\n\n%s\n\n---\n*Reviewed by [Prism](https://github.com/andreatchori/prism) - self-hosted AI code review agent*", review)
+	return fmt.Sprintf("%s\n## Prism Code Review\n\n%s\n\n---\n*Reviewed by [Prism](https://github.com/andreatchori/prism) - self-hosted AI code review agent*", prismCommentMarker, review)
 }
