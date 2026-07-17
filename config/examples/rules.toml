@@ -41,3 +41,19 @@ block_on_critical = true
 suggest_fixes = true
 praise_good_code = true
 max_diff_lines = 10000
+# When true, Prism posts one-click applicable code suggestions (GitHub
+# "suggested changes") derived from the rules above.
+propose_changes = true
+
+# Deterministic, manager-defined auto-fixes. Each rule rewrites added diff lines
+# matching `pattern` (Go regexp) using `replacement` ($1 backrefs supported).
+# These run without the LLM and require behavior.propose_changes = true.
+[[suggestions]]
+pattern = 'fmt\.Println\('
+replacement = 'log.Println('
+message = "Use the logger instead of fmt.Println in production code"
+
+[[suggestions]]
+pattern = 'interface\{\}'
+replacement = 'any'
+message = "Prefer the `any` alias over interface{} (Go 1.18+)"

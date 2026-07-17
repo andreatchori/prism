@@ -17,6 +17,10 @@ import (
 	"github.com/andreatchori/prism/internal/reviewer"
 )
 
+// maxWebhookBodyBytes caps the webhook payload size (25 MB) to avoid unbounded
+// memory use from oversized or malicious requests.
+const maxWebhookBodyBytes = 25 << 20
+
 type PullRequest struct {
 	ID       string
 	Title    string
@@ -28,9 +32,10 @@ type PullRequest struct {
 // WebhookHandler detects the platform and routes accordingly
 func WebhookHandler(cfg *config.Config) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, maxWebhookBodyBytes)
 		body, err := io.ReadAll(r.Body)
 		if err != nil {
-			http.Error(w, "failed to read body", http.StatusBadRequest)
+			http.Error(w, "failed to read body (too large?)", http.StatusRequestEntityTooLarge)
 			return
 		}
 		defer r.Body.Close()
@@ -157,7 +162,8 @@ func handleGitHub(w http.ResponseWriter, payload map[string]interface{}, cfg *co
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{"status":"accepted"}`))
 
-	go processGitHubReview(owner, repo, prNumber, sha, cfg)
+	key := fmt.Sprintf("github:%s/%s#%d", owner, repo, prNumber)
+	runReview(key, func() { processGitHubReview(owner, repo, prNumber, sha, cfg) })
 }
 
 func processGitHubReview(owner, repo string, prNumber int, sha string, cfg *config.Config) {
@@ -181,7 +187,9 @@ func processGitHubReview(owner, repo string, prNumber int, sha string, cfg *conf
 		log.Printf("Failed to post comment on PR #%d: %v", prNumber, err)
 	}
 
-	if inline := inlineCommentsFromFindings(result.Findings); len(inline) > 0 {
+	inline := inlineCommentsFromFindings(result.Findings)
+	inline = append(inline, inlineCommentsFromSuggestions(result.Suggestions)...)
+	if len(inline) > 0 {
 		if err := gh.PostReview(owner, repo, prNumber, sha, inline); err != nil {
 			log.Printf("Failed to post inline review on PR #%d: %v", prNumber, err)
 		}
@@ -207,12 +215,37 @@ func inlineCommentsFromFindings(findings []engine.Finding) []InlineComment {
 			continue
 		}
 		severity := strings.ToUpper(f.Severity)
-		body := fmt.Sprintf("**Prism [%s]** (%s): %s", severity, f.Category, f.Rule)
+		body := fmt.Sprintf("%s\n**Prism [%s]** (%s): %s", prismInlineMarker, severity, f.Category, f.Rule)
 		out = append(out, InlineComment{
 			Path: f.File,
 			Line: *f.Line,
 			Body: body,
 		})
+	}
+	return out
+}
+
+// inlineCommentsFromSuggestions converts rule-based suggestions into GitHub
+// inline comments carrying a one-click applicable ```suggestion block.
+func inlineCommentsFromSuggestions(suggestions []reviewer.Suggestion) []InlineComment {
+	var out []InlineComment
+	for _, s := range suggestions {
+		if s.File == "" || s.Line == 0 || strings.TrimSpace(s.Code) == "" {
+			continue
+		}
+		code := strings.TrimRight(s.Code, "\n")
+		body := prismInlineMarker + "\n**Prism suggestion** (rule-based)"
+		if r := strings.TrimSpace(s.Rationale); r != "" {
+			body += ": " + r
+		}
+		body += fmt.Sprintf("\n\n```suggestion\n%s\n```", code)
+
+		ic := InlineComment{Path: s.File, Line: s.Line, Body: body}
+		if s.EndLine > s.Line {
+			ic.Line = s.EndLine
+			ic.StartLine = s.Line
+		}
+		out = append(out, ic)
 	}
 	return out
 }
@@ -256,7 +289,8 @@ func handleGitLab(w http.ResponseWriter, payload map[string]interface{}, cfg *co
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{"status":"accepted"}`))
 
-	go processGitLabReview(projectID, mrIID, sha, cfg)
+	key := fmt.Sprintf("gitlab:%s!%d", projectID, mrIID)
+	runReview(key, func() { processGitLabReview(projectID, mrIID, sha, cfg) })
 }
 
 func processGitLabReview(projectID string, mrIID int, sha string, cfg *config.Config) {
@@ -278,6 +312,15 @@ func processGitLabReview(projectID string, mrIID int, sha string, cfg *config.Co
 
 	if err := gl.PostComment(projectID, mrIID, result.Body); err != nil {
 		log.Printf("Failed to post comment on MR !%d: %v", mrIID, err)
+	}
+
+	if cfg.Behavior.ProposeChanges && len(result.Suggestions) > 0 {
+		refs, err := gl.GetDiffRefs(projectID, mrIID)
+		if err != nil {
+			log.Printf("Failed to fetch diff refs for MR !%d: %v", mrIID, err)
+		} else if err := gl.PostSuggestions(projectID, mrIID, refs, result.Suggestions); err != nil {
+			log.Printf("Failed to post inline suggestions on MR !%d: %v", mrIID, err)
+		}
 	}
 
 	passed := true
@@ -312,7 +355,8 @@ func handleAzure(w http.ResponseWriter, payload map[string]interface{}, cfg *con
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{"status":"accepted"}`))
 
-	go processAzureReview(org, project, repoID, prID, cfg)
+	key := fmt.Sprintf("azure:%s/%s/%s#%d", org, project, repoID, prID)
+	runReview(key, func() { processAzureReview(org, project, repoID, prID, cfg) })
 }
 
 func processAzureReview(org, project, repoID string, prID int, cfg *config.Config) {
@@ -367,7 +411,8 @@ func handleBitbucket(w http.ResponseWriter, eventKey string, payload map[string]
 	w.WriteHeader(http.StatusAccepted)
 	w.Write([]byte(`{"status":"accepted"}`))
 
-	go processBitbucketReview(workspace, repoSlug, prID, sha, cfg)
+	key := fmt.Sprintf("bitbucket:%s/%s#%d", workspace, repoSlug, prID)
+	runReview(key, func() { processBitbucketReview(workspace, repoSlug, prID, sha, cfg) })
 }
 
 func processBitbucketReview(workspace, repoSlug string, prID int, sha string, cfg *config.Config) {

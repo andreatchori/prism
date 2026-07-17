@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 type AzureClient struct {
@@ -20,7 +21,10 @@ type AzureClient struct {
 
 type azureIterationList struct {
 	Value []struct {
-		ID int `json:"id"`
+		ID              int `json:"id"`
+		SourceRefCommit struct {
+			CommitID string `json:"commitId"`
+		} `json:"sourceRefCommit"`
 	} `json:"value"`
 }
 
@@ -28,16 +32,25 @@ type azureChanges struct {
 	ChangeEntries []struct {
 		ChangeType string `json:"changeType"`
 		Item       struct {
-			Path string `json:"path"`
+			Path     string `json:"path"`
+			IsFolder bool   `json:"isFolder"`
+			ObjectID string `json:"objectId"`
 		} `json:"item"`
 	} `json:"changeEntries"`
 }
+
+// azureMaxFiles caps how many changed files we fetch content for, to keep the
+// review payload and API usage bounded.
+const azureMaxFiles = 50
+
+// azureMaxFileBytes skips files larger than this when building the diff.
+const azureMaxFileBytes = 200 * 1024
 
 func NewAzureClient() *AzureClient {
 	return &AzureClient{
 		pat:    os.Getenv("AZURE_DEVOPS_PAT"),
 		org:    os.Getenv("AZURE_DEVOPS_ORG"),
-		client: &http.Client{},
+		client: &http.Client{Timeout: 45 * time.Second},
 	}
 }
 
@@ -46,11 +59,88 @@ func (a *AzureClient) authHeader() string {
 	return "Basic " + token
 }
 
-// FetchDiff builds a text summary of changed files in the latest PR iteration.
+// FetchDiff builds a unified-diff-like view of the latest PR iteration.
+//
+// Azure does not expose a raw unified diff cheaply, so for added/edited files we
+// fetch the new file content at the source commit and emit it as an all-added
+// hunk. This gives Ollama real code and lets the Rust engine (which scans added
+// lines) run. Deleted files and folders are listed only.
 func (a *AzureClient) FetchDiff(org, project, repoID string, prID int) (string, error) {
 	if org == "" {
 		org = a.org
 	}
+
+	iterationID, sourceCommit, err := a.latestIteration(org, project, repoID, prID)
+	if err != nil {
+		return "", err
+	}
+
+	changes, err := a.iterationChanges(org, project, repoID, prID, iterationID)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	fetched := 0
+	for _, entry := range changes.ChangeEntries {
+		path := entry.Item.Path
+		if path == "" || entry.Item.IsFolder {
+			continue
+		}
+
+		changeType := strings.ToLower(entry.ChangeType)
+		if strings.Contains(changeType, "delete") {
+			b.WriteString(fmt.Sprintf("diff --git a%s b%s\n", path, path))
+			b.WriteString(fmt.Sprintf("--- a%s\n+++ /dev/null\n", path))
+			continue
+		}
+
+		if fetched >= azureMaxFiles {
+			b.WriteString(fmt.Sprintf("# skipped %s (file limit reached)\n", path))
+			continue
+		}
+
+		content, err := a.fileContent(org, project, repoID, path, sourceCommit)
+		if err != nil {
+			log.Printf("Azure: could not fetch %s: %v", path, err)
+			b.WriteString(fmt.Sprintf("diff --git a%s b%s\n# [%s] content unavailable\n", path, path, entry.ChangeType))
+			continue
+		}
+		fetched++
+
+		writeSyntheticDiff(&b, path, content, strings.Contains(changeType, "add"))
+	}
+
+	if b.Len() == 0 {
+		return fmt.Sprintf("# Azure DevOps PR #%d: no reviewable file changes\n", prID), nil
+	}
+	return b.String(), nil
+}
+
+// writeSyntheticDiff emits an all-added unified diff block for a file's content.
+func writeSyntheticDiff(b *strings.Builder, path, content string, isNew bool) {
+	lines := strings.Split(strings.ReplaceAll(content, "\r\n", "\n"), "\n")
+	// Drop a trailing empty element from a final newline
+	if n := len(lines); n > 0 && lines[n-1] == "" {
+		lines = lines[:n-1]
+	}
+
+	b.WriteString(fmt.Sprintf("diff --git a%s b%s\n", path, path))
+	if isNew {
+		b.WriteString("--- /dev/null\n")
+	} else {
+		b.WriteString(fmt.Sprintf("--- a%s\n", path))
+	}
+	b.WriteString(fmt.Sprintf("+++ b%s\n", path))
+	b.WriteString(fmt.Sprintf("@@ -0,0 +1,%d @@\n", len(lines)))
+	for _, l := range lines {
+		b.WriteString("+")
+		b.WriteString(l)
+		b.WriteString("\n")
+	}
+}
+
+func (a *AzureClient) latestIteration(org, project, repoID string, prID int) (int, string, error) {
 	iterationsURL := fmt.Sprintf(
 		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/pullRequests/%d/iterations?api-version=7.1",
 		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), prID,
@@ -58,74 +148,115 @@ func (a *AzureClient) FetchDiff(org, project, repoID string, prID int) (string, 
 
 	req, err := http.NewRequest("GET", iterationsURL, nil)
 	if err != nil {
-		return "", err
+		return 0, "", err
 	}
 	req.Header.Set("Authorization", a.authHeader())
 
 	resp, err := a.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to list iterations: %w", err)
+		return 0, "", fmt.Errorf("failed to list iterations: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Azure DevOps iterations status %d: %s", resp.StatusCode, string(body))
+		return 0, "", fmt.Errorf("Azure DevOps iterations status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var iters azureIterationList
 	if err := json.NewDecoder(resp.Body).Decode(&iters); err != nil {
-		return "", fmt.Errorf("failed to decode iterations: %w", err)
+		return 0, "", fmt.Errorf("failed to decode iterations: %w", err)
 	}
 	if len(iters.Value) == 0 {
-		return "", fmt.Errorf("no iterations found for PR %d", prID)
+		return 0, "", fmt.Errorf("no iterations found for PR %d", prID)
 	}
-	iterationID := iters.Value[len(iters.Value)-1].ID
+	last := iters.Value[len(iters.Value)-1]
+	return last.ID, last.SourceRefCommit.CommitID, nil
+}
 
+func (a *AzureClient) iterationChanges(org, project, repoID string, prID, iterationID int) (*azureChanges, error) {
 	changesURL := fmt.Sprintf(
 		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/pullRequests/%d/iterations/%d/changes?api-version=7.1",
 		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), prID, iterationID,
 	)
 
-	req, err = http.NewRequest("GET", changesURL, nil)
+	req, err := http.NewRequest("GET", changesURL, nil)
 	if err != nil {
-		return "", err
+		return nil, err
 	}
 	req.Header.Set("Authorization", a.authHeader())
 
-	resp, err = a.client.Do(req)
+	resp, err := a.client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("failed to fetch changes: %w", err)
+		return nil, fmt.Errorf("failed to fetch changes: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		return "", fmt.Errorf("Azure DevOps changes status %d: %s", resp.StatusCode, string(body))
+		return nil, fmt.Errorf("Azure DevOps changes status %d: %s", resp.StatusCode, string(body))
 	}
 
 	var changes azureChanges
 	if err := json.NewDecoder(resp.Body).Decode(&changes); err != nil {
-		return "", fmt.Errorf("failed to decode changes: %w", err)
+		return nil, fmt.Errorf("failed to decode changes: %w", err)
 	}
-
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("# Azure DevOps PR #%d changes (iteration %d)\n\n", prID, iterationID))
-	for _, entry := range changes.ChangeEntries {
-		path := entry.Item.Path
-		if path == "" {
-			continue
-		}
-		b.WriteString(fmt.Sprintf("- [%s] %s\n", entry.ChangeType, path))
-	}
-	return b.String(), nil
+	return &changes, nil
 }
 
-// PostComment creates a PR thread comment
+// fileContent fetches a file's raw text at a specific commit.
+func (a *AzureClient) fileContent(org, project, repoID, path, commit string) (string, error) {
+	endpoint := fmt.Sprintf(
+		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/items?path=%s&api-version=7.1&$format=text",
+		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), url.QueryEscape(path),
+	)
+	if commit != "" {
+		endpoint += "&versionDescriptor.version=" + url.QueryEscape(commit) + "&versionDescriptor.versionType=commit"
+	}
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", a.authHeader())
+	req.Header.Set("Accept", "text/plain")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return "", fmt.Errorf("items status %d: %s", resp.StatusCode, string(body))
+	}
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, azureMaxFileBytes))
+	if err != nil {
+		return "", err
+	}
+	return string(body), nil
+}
+
+// PostComment upserts a PR thread comment: updates the existing Prism comment
+// when present, otherwise creates a new thread.
 func (a *AzureClient) PostComment(org, project, repoID string, prID int, comment string) error {
 	if org == "" {
 		org = a.org
 	}
+
+	content := formatAzureComment(comment)
+
+	threadID, commentID, err := a.findPrismThread(org, project, repoID, prID)
+	if err != nil {
+		log.Printf("Could not look up existing Azure thread (will create new): %v", err)
+	}
+
+	if threadID != 0 && commentID != 0 {
+		return a.updateThreadComment(org, project, repoID, prID, threadID, commentID, content)
+	}
+
 	endpoint := fmt.Sprintf(
 		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/pullRequests/%d/threads?api-version=7.1",
 		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), prID,
@@ -134,7 +265,7 @@ func (a *AzureClient) PostComment(org, project, repoID string, prID int, comment
 	payload := fmt.Sprintf(`{
 		"comments": [{"parentCommentId": 0, "content": %q, "commentType": 1}],
 		"status": 1
-	}`, formatAzureComment(comment))
+	}`, content)
 
 	req, err := http.NewRequest("POST", endpoint, strings.NewReader(payload))
 	if err != nil {
@@ -156,6 +287,83 @@ func (a *AzureClient) PostComment(org, project, repoID string, prID int, comment
 
 	log.Printf("Comment posted on Azure DevOps PR #%d", prID)
 	return nil
+}
+
+func (a *AzureClient) updateThreadComment(org, project, repoID string, prID, threadID, commentID int, content string) error {
+	endpoint := fmt.Sprintf(
+		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/pullRequests/%d/threads/%d/comments/%d?api-version=7.1",
+		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), prID, threadID, commentID,
+	)
+
+	payload := fmt.Sprintf(`{"content": %q}`, content)
+	req, err := http.NewRequest("PATCH", endpoint, strings.NewReader(payload))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Authorization", a.authHeader())
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("failed to update comment: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("Azure DevOps update status %d: %s", resp.StatusCode, string(body))
+	}
+
+	log.Printf("Comment updated on Azure DevOps PR #%d (thread %d)", prID, threadID)
+	return nil
+}
+
+// findPrismThread returns the thread ID and comment ID of an existing Prism
+// comment, or zeros if none.
+func (a *AzureClient) findPrismThread(org, project, repoID string, prID int) (int, int, error) {
+	endpoint := fmt.Sprintf(
+		"https://dev.azure.com/%s/%s/_apis/git/repositories/%s/pullRequests/%d/threads?api-version=7.1",
+		url.PathEscape(org), url.PathEscape(project), url.PathEscape(repoID), prID,
+	)
+
+	req, err := http.NewRequest("GET", endpoint, nil)
+	if err != nil {
+		return 0, 0, err
+	}
+	req.Header.Set("Authorization", a.authHeader())
+
+	resp, err := a.client.Do(req)
+	if err != nil {
+		return 0, 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return 0, 0, fmt.Errorf("list threads status %d: %s", resp.StatusCode, string(body))
+	}
+
+	var result struct {
+		Value []struct {
+			ID       int `json:"id"`
+			Comments []struct {
+				ID      int    `json:"id"`
+				Content string `json:"content"`
+			} `json:"comments"`
+		} `json:"value"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0, 0, err
+	}
+
+	for _, thread := range result.Value {
+		for _, c := range thread.Comments {
+			if strings.Contains(c.Content, prismCommentMarker) {
+				return thread.ID, c.ID, nil
+			}
+		}
+	}
+	return 0, 0, nil
 }
 
 // SetPRStatus sets a pull request status
@@ -272,7 +480,7 @@ func parseAzureOrg(baseURL, fallback string) string {
 }
 
 func formatAzureComment(review string) string {
-	return fmt.Sprintf("## Prism Code Review\n\n%s\n\n---\n*Reviewed by [Prism](https://github.com/andreatchori/prism) - self-hosted AI code review agent*", review)
+	return fmt.Sprintf("%s\n## Prism Code Review\n\n%s\n\n---\n*Reviewed by [Prism](https://github.com/andreatchori/prism) - self-hosted AI code review agent*", prismCommentMarker, review)
 }
 
 // verifyAzureBasicAuth checks optional Basic auth when AZURE_WEBHOOK_SECRET is set

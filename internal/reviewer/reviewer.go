@@ -1,6 +1,7 @@
 package reviewer
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -11,6 +12,21 @@ import (
 	"github.com/andreatchori/prism/internal/llm"
 )
 
+const (
+	suggestionsStartMarker = "PRISM_SUGGESTIONS_START"
+	suggestionsEndMarker   = "PRISM_SUGGESTIONS_END"
+)
+
+// Suggestion is a rule-based, one-click applicable code change proposed for a
+// specific file and line range.
+type Suggestion struct {
+	File      string `json:"file"`
+	Line      uint   `json:"line"`
+	EndLine   uint   `json:"end_line"`
+	Code      string `json:"code"`
+	Rationale string `json:"rationale"`
+}
+
 // Result holds the review body and whether critical issues were found.
 type Result struct {
 	Body        string
@@ -18,6 +34,8 @@ type Result struct {
 	// Findings are the deterministic engine findings (with file/line), usable
 	// for inline review comments. Empty when the engine is unavailable.
 	Findings []engine.Finding
+	// Suggestions are rule-based code proposals (opt-in via propose_changes).
+	Suggestions []Suggestion
 }
 
 // Review runs the Rust deterministic engine first, then Ollama for deeper analysis.
@@ -50,6 +68,12 @@ func Review(diff string, cfg *config.Config) (*Result, error) {
 		findings = engineReport.Findings
 	}
 
+	// Deterministic, rule-based suggestions can be produced without the LLM.
+	var deterministic []Suggestion
+	if cfg.Behavior.ProposeChanges {
+		deterministic = deterministicSuggestions(diff, cfg)
+	}
+
 	prompt := buildPrompt(diff, cfg, engineReport)
 	llmBody, err := llm.Analyze(prompt)
 	if err != nil {
@@ -57,9 +81,24 @@ func Review(diff string, cfg *config.Config) (*Result, error) {
 		if engineReport != nil && len(engineReport.Findings) > 0 {
 			body := engine.FormatMarkdown(engineReport)
 			body += "\n\nPRISM_VERDICT: FAIL\n"
-			return &Result{Body: body, HasCritical: engineReport.HasCritical, Findings: findings}, nil
+			return &Result{Body: body, HasCritical: engineReport.HasCritical, Findings: findings, Suggestions: deterministic}, nil
+		}
+		if len(deterministic) > 0 {
+			return &Result{Body: engine.FormatMarkdown(engineReport), HasCritical: false, Findings: findings, Suggestions: deterministic}, nil
 		}
 		return nil, err
+	}
+
+	var suggestions []Suggestion
+	if cfg.Behavior.ProposeChanges {
+		var llmSuggestions []Suggestion
+		llmSuggestions, llmBody = extractSuggestions(llmBody)
+		llmSuggestions = validateSuggestions(llmSuggestions, diff)
+		suggestions = mergeSuggestions(deterministic, llmSuggestions)
+		if len(suggestions) > 0 {
+			log.Printf("Reviewer: %d rule-based suggestion(s) proposed (%d deterministic, %d from LLM)",
+				len(suggestions), len(deterministic), len(llmSuggestions))
+		}
 	}
 
 	body := mergeBodies(engine.FormatMarkdown(engineReport), llmBody)
@@ -72,7 +111,45 @@ func Review(diff string, cfg *config.Config) (*Result, error) {
 		Body:        body,
 		HasCritical: hasCritical,
 		Findings:    findings,
+		Suggestions: suggestions,
 	}, nil
+}
+
+// extractSuggestions parses the machine-readable suggestions block (JSONL between
+// markers) and returns the suggestions plus the body with that block removed.
+func extractSuggestions(body string) ([]Suggestion, string) {
+	start := strings.Index(body, suggestionsStartMarker)
+	if start == -1 {
+		return nil, body
+	}
+	end := strings.Index(body, suggestionsEndMarker)
+	if end == -1 || end < start {
+		return nil, body
+	}
+
+	block := body[start+len(suggestionsStartMarker) : end]
+	cleaned := strings.TrimSpace(body[:start]) + "\n" + strings.TrimSpace(body[end+len(suggestionsEndMarker):])
+
+	var suggestions []Suggestion
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || !strings.HasPrefix(line, "{") {
+			continue
+		}
+		var s Suggestion
+		if err := json.Unmarshal([]byte(line), &s); err != nil {
+			log.Printf("Reviewer: skipping malformed suggestion: %v", err)
+			continue
+		}
+		if s.File == "" || s.Line == 0 || strings.TrimSpace(s.Code) == "" {
+			continue
+		}
+		if s.EndLine == 0 || s.EndLine < s.Line {
+			s.EndLine = s.Line
+		}
+		suggestions = append(suggestions, s)
+	}
+	return suggestions, strings.TrimSpace(cleaned)
 }
 
 func mergeBodies(engineSection, llmBody string) string {
@@ -121,6 +198,26 @@ func buildPrompt(diff string, cfg *config.Config, engineReport *engine.Report) s
 	}
 	instructions = append(instructions, "Be concise and actionable")
 
+	suggestionsSection := ""
+	if cfg.Behavior.ProposeChanges {
+		suggestionsSection = fmt.Sprintf(`
+
+## Proposed changes (rule-based)
+When a rule above is violated and you can fix it, propose a concrete replacement.
+After the verdict line, output a machine-readable block, one compact JSON object
+per line, between the markers below. Only include lines that appear as added
+(prefixed with '+') in the diff. Use the file path and the new-file line number.
+The "code" field must contain the full replacement for the given line range,
+without the leading '+'. Keep suggestions minimal and directly tied to a rule.
+
+%s
+{"file":"path/to/file","line":12,"end_line":12,"code":"fixed line here","rationale":"which rule"}
+%s
+
+If you have no concrete fix, output the two markers with nothing between them.`,
+			suggestionsStartMarker, suggestionsEndMarker)
+	}
+
 	engineHint := "No deterministic findings were pre-reported."
 	if engineReport != nil && len(engineReport.Findings) > 0 {
 		engineHint = fmt.Sprintf(
@@ -168,6 +265,7 @@ Structure your response as:
 End your response with exactly one of these lines:
 PRISM_VERDICT: PASS
 PRISM_VERDICT: FAIL
+%s
 `,
 		cfg.Reviewer.Name,
 		cfg.Reviewer.Tone,
@@ -179,5 +277,6 @@ PRISM_VERDICT: FAIL
 		strings.Join(instructions, "\n- "),
 		engineHint,
 		diff,
+		suggestionsSection,
 	)
 }

@@ -10,7 +10,51 @@ import (
 	"testing"
 
 	"github.com/andreatchori/prism/internal/engine"
+	"github.com/andreatchori/prism/internal/reviewer"
 )
+
+func TestInlineCommentsFromSuggestions(t *testing.T) {
+	suggestions := []reviewer.Suggestion{
+		{File: "main.go", Line: 12, EndLine: 12, Code: "fmt.Println(x)", Rationale: "no debug print"},
+		{File: "util.go", Line: 3, EndLine: 5, Code: "a\nb\nc", Rationale: "multi-line"},
+		{File: "", Line: 1, Code: "x"},     // dropped (no file)
+		{File: "z.go", Line: 0, Code: "x"}, // dropped (no line)
+		{File: "z.go", Line: 4, Code: " "}, // dropped (empty code)
+	}
+
+	out := inlineCommentsFromSuggestions(suggestions)
+	if len(out) != 2 {
+		t.Fatalf("expected 2 inline suggestions, got %d", len(out))
+	}
+	if !strings.Contains(out[0].Body, "```suggestion\nfmt.Println(x)\n```") {
+		t.Errorf("expected suggestion block, got %q", out[0].Body)
+	}
+	if !strings.Contains(out[0].Body, "no debug print") {
+		t.Errorf("expected rationale in body, got %q", out[0].Body)
+	}
+	if out[1].StartLine != 3 || out[1].Line != 5 {
+		t.Errorf("expected multi-line span 3..5, got start=%d line=%d", out[1].StartLine, out[1].Line)
+	}
+}
+
+func TestWriteSyntheticDiff(t *testing.T) {
+	var b strings.Builder
+	writeSyntheticDiff(&b, "/src/main.go", "package main\nfunc main() {}\n", true)
+	out := b.String()
+
+	for _, want := range []string{
+		"diff --git a/src/main.go b/src/main.go",
+		"--- /dev/null",
+		"+++ b/src/main.go",
+		"@@ -0,0 +1,2 @@",
+		"+package main",
+		"+func main() {}",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("synthetic diff missing %q:\n%s", want, out)
+		}
+	}
+}
 
 func TestInlineCommentsFromFindings(t *testing.T) {
 	line := uint(7)
@@ -29,6 +73,43 @@ func TestInlineCommentsFromFindings(t *testing.T) {
 	}
 	if !strings.Contains(out[0].Body, "CRITICAL") || !strings.Contains(out[0].Body, "No secrets") {
 		t.Errorf("unexpected body: %q", out[0].Body)
+	}
+}
+
+func TestGitlabSuggestionBody(t *testing.T) {
+	line, body := gitlabSuggestionBody(reviewer.Suggestion{
+		File: "main.go", Line: 12, EndLine: 12, Code: "fmt.Println(x)\n", Rationale: "no debug print",
+	})
+	if line != 12 {
+		t.Errorf("anchor line = %d, want 12", line)
+	}
+	if !strings.Contains(body, "```suggestion:-0+0\nfmt.Println(x)\n```") {
+		t.Errorf("expected single-line suggestion block, got %q", body)
+	}
+	if !strings.Contains(body, "no debug print") {
+		t.Errorf("expected rationale, got %q", body)
+	}
+	if !strings.Contains(body, prismSuggestionMarker) {
+		t.Errorf("expected hidden suggestion marker, got %q", body)
+	}
+
+	line, body = gitlabSuggestionBody(reviewer.Suggestion{
+		File: "util.go", Line: 3, EndLine: 5, Code: "a\nb\nc",
+	})
+	if line != 3 {
+		t.Errorf("multi-line anchor = %d, want 3", line)
+	}
+	if !strings.Contains(body, "```suggestion:-0+2\na\nb\nc\n```") {
+		t.Errorf("expected multi-line span -0+2, got %q", body)
+	}
+}
+
+func TestSuggestionKey(t *testing.T) {
+	if got := suggestionKey("main.go", 12); got != "main.go:12" {
+		t.Errorf("suggestionKey = %q, want main.go:12", got)
+	}
+	if suggestionKey("a.go", 1) == suggestionKey("a.go", 2) {
+		t.Error("different lines should produce different keys")
 	}
 }
 

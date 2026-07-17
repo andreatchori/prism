@@ -75,7 +75,29 @@ items = [
 block_on_critical = true
 suggest_fixes = true
 praise_good_code = true
+# Opt-in: post one-click applicable code suggestions based on the rules above.
+propose_changes = true
 ```
+
+### Rule-based suggestions (`propose_changes`)
+
+When `propose_changes = true`, Prism does not only flag issues - it proposes a
+concrete fix tied to the rules the manager defined. On GitHub these are posted as
+native **suggested changes**, so the PR author can apply them in one click. The
+model returns each proposal in a machine-readable block (file, line range, and
+replacement code); Prism strips that block from the human-readable comment and
+renders it as inline ```suggestion blocks. Leave the flag `false` to keep Prism
+in report-only mode.
+
+Supported platforms for one-click suggestions:
+
+- **GitHub** - native suggested changes (```suggestion) posted as an inline review.
+- **GitLab** - inline discussions using the ```suggestion:-0+N syntax (anchored
+  via the MR diff refs); multi-line proposals are supported. On subsequent pushes,
+  existing Prism suggestions at the same file/line are updated in place rather
+  than duplicated, and stale ones (no longer proposed) are automatically resolved.
+
+Azure DevOps and Bitbucket still receive the proposals inside the summary comment.
 
 ## Getting Started
 
@@ -156,7 +178,7 @@ Prism listens on port `8080`. Ollama is available at `http://localhost:11434`.
 
 **GitLab:** Settings → Webhooks → URL `…/webhook`, trigger **Merge request events**. Secret token = `GITLAB_WEBHOOK_SECRET`.
 
-**Azure DevOps:** Project Settings → Service hooks → Web Hooks → events **Pull request created** / **updated**. URL `…/webhook`. Optional Basic auth password = `AZURE_WEBHOOK_SECRET`.
+**Azure DevOps:** Project Settings → Service hooks → Web Hooks → events **Pull request created** / **updated**. URL `…/webhook`. Optional Basic auth password = `AZURE_WEBHOOK_SECRET`. Azure has no cheap raw diff, so Prism fetches changed file contents (capped at 50 files / 200 KB each) and reviews them as added lines.
 
 **Bitbucket:** Repository Settings → Webhooks → URL `…/webhook`, triggers **Pull Request Created** / **Updated**. Optional secret = `BITBUCKET_WEBHOOK_SECRET`.
 

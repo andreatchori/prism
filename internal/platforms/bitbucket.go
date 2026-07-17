@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -11,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"time"
 )
 
 type BitbucketClient struct {
@@ -25,7 +27,7 @@ func NewBitbucketClient() *BitbucketClient {
 		username: os.Getenv("BITBUCKET_USERNAME"),
 		appPass:  os.Getenv("BITBUCKET_APP_PASSWORD"),
 		token:    os.Getenv("BITBUCKET_TOKEN"),
-		client:   &http.Client{},
+		client:   &http.Client{Timeout: 30 * time.Second},
 	}
 }
 
@@ -68,15 +70,28 @@ func (b *BitbucketClient) FetchDiff(workspace, repoSlug string, prID int) (strin
 	return string(body), nil
 }
 
-// PostComment posts a comment on the Pull Request
+// PostComment upserts a comment on the Pull Request: updates the existing Prism
+// comment when present, otherwise creates a new one.
 func (b *BitbucketClient) PostComment(workspace, repoSlug string, prID int, comment string) error {
-	endpoint := fmt.Sprintf(
+	base := fmt.Sprintf(
 		"https://api.bitbucket.org/2.0/repositories/%s/%s/pullrequests/%d/comments",
 		url.PathEscape(workspace), url.PathEscape(repoSlug), prID,
 	)
 
+	existingID, err := b.findPrismComment(base)
+	if err != nil {
+		log.Printf("Could not look up existing Bitbucket comment (will create new): %v", err)
+	}
+
+	method := "POST"
+	endpoint := base
+	if existingID != 0 {
+		method = "PUT"
+		endpoint = fmt.Sprintf("%s/%d", base, existingID)
+	}
+
 	payload := fmt.Sprintf(`{"content": {"raw": %q}}`, formatBitbucketComment(comment))
-	req, err := http.NewRequest("POST", endpoint, strings.NewReader(payload))
+	req, err := http.NewRequest(method, endpoint, strings.NewReader(payload))
 	if err != nil {
 		return err
 	}
@@ -94,8 +109,52 @@ func (b *BitbucketClient) PostComment(workspace, repoSlug string, prID int, comm
 		return fmt.Errorf("Bitbucket API returned status %d: %s", resp.StatusCode, string(body))
 	}
 
-	log.Printf("Comment posted on Bitbucket PR #%d", prID)
+	if existingID != 0 {
+		log.Printf("Comment updated on Bitbucket PR #%d (id %d)", prID, existingID)
+	} else {
+		log.Printf("Comment posted on Bitbucket PR #%d", prID)
+	}
 	return nil
+}
+
+// findPrismComment returns the ID of an existing Prism comment, or 0 if none.
+func (b *BitbucketClient) findPrismComment(base string) (int64, error) {
+	req, err := http.NewRequest("GET", base+"?pagelen=100", nil)
+	if err != nil {
+		return 0, err
+	}
+	b.setAuth(req)
+
+	resp, err := b.client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		return 0, fmt.Errorf("list comments status %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var page struct {
+		Values []struct {
+			ID      int64 `json:"id"`
+			Content struct {
+				Raw string `json:"raw"`
+			} `json:"content"`
+			Deleted bool `json:"deleted"`
+		} `json:"values"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&page); err != nil {
+		return 0, err
+	}
+
+	for _, c := range page.Values {
+		if !c.Deleted && strings.Contains(c.Content.Raw, prismCommentMarker) {
+			return c.ID, nil
+		}
+	}
+	return 0, nil
 }
 
 // SetCommitStatus sets a build status on the head commit
@@ -186,7 +245,7 @@ func ExtractBitbucketPRInfo(payload map[string]interface{}) (workspace, repoSlug
 }
 
 func formatBitbucketComment(review string) string {
-	return fmt.Sprintf("## Prism Code Review\n\n%s\n\n---\n*Reviewed by [Prism](https://github.com/andreatchori/prism) - self-hosted AI code review agent*", review)
+	return fmt.Sprintf("%s\n## Prism Code Review\n\n%s\n\n---\n*Reviewed by [Prism](https://github.com/andreatchori/prism) - self-hosted AI code review agent*", prismCommentMarker, review)
 }
 
 // verifyBitbucketSignature checks X-Hub-Signature when BITBUCKET_WEBHOOK_SECRET is set.
