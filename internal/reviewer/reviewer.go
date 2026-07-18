@@ -1,6 +1,7 @@
 package reviewer
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -75,7 +76,15 @@ func Review(diff string, cfg *config.Config) (*Result, error) {
 	}
 
 	prompt := buildPrompt(diff, cfg, engineReport)
-	llmBody, err := llm.Analyze(prompt)
+
+	var llmBody string
+	provider, err := llm.New(llm.Options{Provider: cfg.LLM.Provider, Model: cfg.LLM.Model, Fallback: cfg.LLM.Fallback})
+	if err == nil {
+		log.Printf("LLM provider: %s", provider.Name())
+		llmBody, err = provider.Analyze(context.Background(), prompt)
+	} else {
+		log.Printf("LLM provider unavailable: %v", err)
+	}
 	if err != nil {
 		// If LLM fails but we have deterministic findings, still return them
 		if engineReport != nil && len(engineReport.Findings) > 0 {

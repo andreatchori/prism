@@ -36,6 +36,15 @@ items = [
     "Prefer streaming over loading large datasets in memory",
 ]
 
+[llm]
+# provider: ollama (local, default) | openai | anthropic | azure-openai
+# API keys are read from the environment, never from this file:
+#   OPENAI_API_KEY / ANTHROPIC_API_KEY / AZURE_OPENAI_API_KEY (+ endpoint/deployment)
+provider = "ollama"
+model = "deepseek-coder:6.7b"
+# Optional: secondary provider used if the primary one fails (e.g. "ollama")
+# fallback = "ollama"
+
 [behavior]
 block_on_critical = true
 suggest_fixes = true

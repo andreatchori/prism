@@ -12,6 +12,7 @@ type Config struct {
 	Reviewer Reviewer `toml:"reviewer"`
 	Rules    Rules    `toml:"rules"`
 	Behavior Behavior `toml:"behavior"`
+	LLM      LLM      `toml:"llm"`
 	// Suggestions are deterministic, manager-defined auto-fixes applied to added
 	// diff lines (regex -> replacement). They require behavior.propose_changes.
 	Suggestions []SuggestionRule `toml:"suggestions"`
@@ -29,6 +30,15 @@ type Reviewer struct {
 	Name     string `toml:"name"`
 	Language string `toml:"language"`
 	Tone     string `toml:"tone"`
+}
+
+// LLM selects which model backend powers the review. API keys are always read
+// from the environment, never from this file.
+type LLM struct {
+	Provider string `toml:"provider"` // ollama | openai | anthropic | azure-openai
+	Model    string `toml:"model"`
+	// Fallback names an optional secondary provider used when the primary fails.
+	Fallback string `toml:"fallback"`
 }
 
 type Rules struct {

@@ -11,7 +11,8 @@
 
 - **100% self-hosted** - your code never leaves your infrastructure
 - **Your rules** - define exactly what you want reviewed via a simple `rules.toml`
-- **Local LLM** - powered by Ollama, no API keys, no cost
+- **Pluggable LLM** - local Ollama by default (no API keys, no cost), or bring your
+  own OpenAI / Anthropic API key
 - **Multi-platform** - GitHub, GitLab, Azure DevOps, Bitbucket
 - **Fast** - core engine written in Rust, orchestration in Go
 
@@ -38,7 +39,7 @@ Webhook (GitHub / GitLab / Azure / Bitbucket)
 | Diff parser | Rust | Parses PR diffs fast |
 | Rules engine | Rust → WASM | Evaluates your custom rules |
 | CLI tool | Rust | Local check before git push |
-| LLM | Ollama | Runs the AI model locally |
+| LLM | Ollama / OpenAI / Anthropic | Runs the AI model (local by default) |
 
 ## How it works
 
@@ -78,6 +79,33 @@ praise_good_code = true
 # Opt-in: post one-click applicable code suggestions based on the rules above.
 propose_changes = true
 ```
+
+### Choosing an LLM provider
+
+By default Prism uses a **local Ollama** model - no API key, no cost, code never
+leaves your infrastructure. You can instead point Prism at a hosted API:
+
+```toml
+[llm]
+provider = "anthropic"   # ollama | openai | anthropic | azure-openai
+model = "claude-3-5-sonnet-latest"
+fallback = "ollama"      # optional: used if the primary provider fails
+```
+
+API keys are read from the environment only (never from `rules.toml`):
+`OPENAI_API_KEY` for OpenAI, `ANTHROPIC_API_KEY` for Anthropic, and
+`AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT` + `AZURE_OPENAI_DEPLOYMENT` for
+Azure OpenAI (there, `model` is the deployment name). `PRISM_LLM_PROVIDER` and
+`PRISM_LLM_FALLBACK` override the config values.
+
+With `fallback` set, Prism tries the primary provider first and transparently
+retries on the secondary when the primary fails (or can't be configured) - handy
+for "cloud first, local Ollama as backup".
+
+> Note: this requires a paid **API** plan (platform.openai.com / console.anthropic.com).
+> A consumer ChatGPT or Claude subscription does **not** grant API access.
+> Sending private code to a hosted provider is a compliance decision - Ollama keeps
+> everything local.
 
 ### Rule-based suggestions (`propose_changes`)
 
