@@ -108,6 +108,8 @@ func resolveBinary() (string, error) {
 		dir := filepath.Dir(exe)
 		candidates = append(candidates,
 			filepath.Join(dir, binaryName()),
+			filepath.Join(dir, "bin", "prism-engine"),
+			filepath.Join(dir, "bin", binaryName()),
 			filepath.Join(dir, "rust", "target", "release", binaryName()),
 		)
 	}

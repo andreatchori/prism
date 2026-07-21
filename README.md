@@ -248,6 +248,42 @@ for "cloud first, local Ollama as backup".
 > Sending private code to a hosted provider is a compliance decision - Ollama keeps
 > everything local.
 
+### Per-repo overrides
+
+The global `PRISM_CONFIG` is the default for every repository. To give one team
+stricter rules or a different LLM, drop a TOML overlay in `PRISM_REPOS_DIR`
+(default `config/repos/`):
+
+| Platform | Repo key | Overlay filename |
+|---|---|---|
+| GitHub | `github:owner/repo` | `github__owner__repo.toml` |
+| GitLab | `gitlab:group/project` | `gitlab__group__project.toml` |
+| Azure DevOps | `azure:org/project/repoId` | `azure__org__project__repoId.toml` |
+| Bitbucket | `bitbucket:workspace/slug` | `bitbucket__workspace__slug.toml` |
+
+Only the fields you set in the overlay replace the base; everything else is inherited.
+Rule sets (`must_have`, `forbidden`, …) and `[[suggestions]]` are replaced as a whole
+when present. Example:
+
+```toml
+# config/repos/github__acme__api.toml
+[llm]
+provider = "anthropic"
+model = "claude-3-5-sonnet-latest"
+fallback = "ollama"
+
+[behavior]
+propose_changes = false
+
+[rules.forbidden]
+items = [
+    "No hardcoded secrets or API keys",
+    "Every PR must update the CHANGELOG",
+]
+```
+
+See `config/repos/example__github__acme__api.toml` for a starter file.
+
 ### Rule-based suggestions (`propose_changes`)
 
 When `propose_changes = true`, Prism does not only flag issues - it proposes a
@@ -325,11 +361,16 @@ docker compose exec ollama ollama pull llama3.2
 
 Prism listens on port `8080`. Ollama is available at `http://localhost:11434`.
 
+The image is multi-stage: it builds the **Go server** and the **Rust rules engine**,
+and ships both. Compose sets `PRISM_ENGINE=/app/bin/prism-engine`, so deterministic
+reviews work out of the box (no separate `cargo build` required for Docker).
+
 ### Environment variables
 
 | Variable | Default | Description |
 |---|---|---|
-| `PRISM_CONFIG` | `config/examples/rules.toml` | Path to rules file |
+| `PRISM_CONFIG` | `config/examples/rules.toml` | Path to global rules file |
+| `PRISM_REPOS_DIR` | `config/repos` | Directory of per-repo overlay TOML files |
 | `PRISM_PORT` | `8080` | HTTP port |
 | `OLLAMA_URL` | `http://localhost:11434` | Ollama base URL |
 | `OLLAMA_MODEL` | `deepseek-coder:6.7b` | Model name |
@@ -345,7 +386,7 @@ Prism listens on port `8080`. Ollama is available at `http://localhost:11434`.
 | `BITBUCKET_APP_PASSWORD` | - | Bitbucket app password |
 | `BITBUCKET_TOKEN` | - | Optional OAuth/Bearer token (alternative auth) |
 | `BITBUCKET_WEBHOOK_SECRET` | - | Optional; enables HMAC signature check |
-| `PRISM_ENGINE` | auto-detect | Path to Rust `prism` CLI (`check --json`); if unset, tries `rust/target/release/prism` |
+| `PRISM_ENGINE` | auto-detect (Docker: `/app/bin/prism-engine`) | Path to Rust rules CLI (`check --json`); if unset, tries `rust/target/release/prism` then `bin/prism-engine` next to the server binary |
 
 ### Webhooks
 

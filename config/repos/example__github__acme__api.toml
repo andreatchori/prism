@@ -1,0 +1,31 @@
+# Per-repo overlay example.
+#
+# File naming: convert the repo key to a filename by replacing ":" and "/" with "__".
+# Examples:
+#   github:acme/api              → github__acme__api.toml
+#   gitlab:group/project         → gitlab__group__project.toml
+#   azure:org/project/repo-id    → azure__org__project__repo-id.toml
+#   bitbucket:workspace/slug     → bitbucket__workspace__slug.toml
+#
+# Only the sections/fields you set here override the global PRISM_CONFIG.
+# Everything else is inherited from the base rules.toml.
+#
+# Copy this file and rename it to match your repo, e.g.:
+#   cp example__github__acme__api.toml github__myorg__myrepo.toml
+
+[llm]
+provider = "anthropic"
+model = "claude-3-5-sonnet-latest"
+fallback = "ollama"
+
+[behavior]
+# Stricter on this repo: block merges on critical findings, but skip one-click suggestions.
+propose_changes = false
+
+[rules.forbidden]
+items = [
+    "No hardcoded secrets or API keys",
+    "No unwrap() without justification",
+    "No debug print statements in production",
+    "Every PR must update the CHANGELOG",
+]

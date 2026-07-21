@@ -39,11 +39,19 @@ type Result struct {
 	Suggestions []Suggestion
 }
 
-// Review runs the Rust deterministic engine first, then Ollama for deeper analysis.
+// Review runs the Rust deterministic engine first, then the configured LLM.
+// The effective cfg (possibly a per-repo merge) is written to a temp file so the
+// Rust engine sees the same rules as the Go reviewer.
 func Review(diff string, cfg *config.Config) (*Result, error) {
-	configPath := os.Getenv("PRISM_CONFIG")
-	if configPath == "" {
-		configPath = "config/examples/rules.toml"
+	configPath, err := config.WriteTemp(cfg)
+	if err != nil {
+		log.Printf("Could not write temp rules for Rust engine: %v", err)
+		configPath = os.Getenv("PRISM_CONFIG")
+		if configPath == "" {
+			configPath = "config/examples/rules.toml"
+		}
+	} else {
+		defer os.Remove(configPath)
 	}
 
 	var engineReport *engine.Report

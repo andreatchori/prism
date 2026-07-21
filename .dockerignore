@@ -2,8 +2,9 @@
 .gitignore
 *.md
 docs/
-rust/
 LICENSE
 *_test.go
 .env
 .env.example
+# Keep Rust sources for the Docker build; skip local build artifacts.
+rust/target/

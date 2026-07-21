@@ -18,6 +18,20 @@ import (
 	"github.com/andreatchori/prism/internal/reviewer"
 )
 
+// effectiveConfig returns the base config merged with an optional per-repo
+// overlay from PRISM_REPOS_DIR. On overlay errors it falls back to base.
+func effectiveConfig(base *config.Config, repoKey string) *config.Config {
+	cfg, path, err := config.Resolve(base, repoKey)
+	if err != nil {
+		slog.Warn("per-repo config overlay failed, using base", "repo", repoKey, "error", err)
+		return base
+	}
+	if path != "" {
+		slog.Info("using per-repo config overlay", "repo", repoKey, "overlay", path)
+	}
+	return cfg
+}
+
 // maxWebhookBodyBytes caps the webhook payload size (25 MB) to avoid unbounded
 // memory use from oversized or malicious requests.
 const maxWebhookBodyBytes = 25 << 20
@@ -174,7 +188,8 @@ func handleGitHub(w http.ResponseWriter, payload map[string]interface{}, cfg *co
 	runReview(key, func() { processGitHubReview(owner, repo, prNumber, sha, cfg) })
 }
 
-func processGitHubReview(owner, repo string, prNumber int, sha string, cfg *config.Config) {
+func processGitHubReview(owner, repo string, prNumber int, sha string, base *config.Config) {
+	cfg := effectiveConfig(base, fmt.Sprintf("github:%s/%s", owner, repo))
 	gh := NewGitHubClient()
 
 	diff, err := gh.FetchDiff(owner, repo, prNumber)
@@ -313,7 +328,8 @@ func handleGitLab(w http.ResponseWriter, payload map[string]interface{}, cfg *co
 	runReview(key, func() { processGitLabReview(projectID, mrIID, sha, cfg) })
 }
 
-func processGitLabReview(projectID string, mrIID int, sha string, cfg *config.Config) {
+func processGitLabReview(projectID string, mrIID int, sha string, base *config.Config) {
+	cfg := effectiveConfig(base, fmt.Sprintf("gitlab:%s", projectID))
 	gl := NewGitLabClient()
 
 	diff, err := gl.FetchDiff(projectID, mrIID)
@@ -379,7 +395,8 @@ func handleAzure(w http.ResponseWriter, payload map[string]interface{}, cfg *con
 	runReview(key, func() { processAzureReview(org, project, repoID, prID, cfg) })
 }
 
-func processAzureReview(org, project, repoID string, prID int, cfg *config.Config) {
+func processAzureReview(org, project, repoID string, prID int, base *config.Config) {
+	cfg := effectiveConfig(base, fmt.Sprintf("azure:%s/%s/%s", org, project, repoID))
 	az := NewAzureClient()
 
 	diff, err := az.FetchDiff(org, project, repoID, prID)
@@ -441,7 +458,8 @@ func handleBitbucket(w http.ResponseWriter, eventKey string, payload map[string]
 	runReview(key, func() { processBitbucketReview(workspace, repoSlug, prID, sha, cfg) })
 }
 
-func processBitbucketReview(workspace, repoSlug string, prID int, sha string, cfg *config.Config) {
+func processBitbucketReview(workspace, repoSlug string, prID int, sha string, base *config.Config) {
+	cfg := effectiveConfig(base, fmt.Sprintf("bitbucket:%s/%s", workspace, repoSlug))
 	bb := NewBitbucketClient()
 
 	diff, err := bb.FetchDiff(workspace, repoSlug, prID)
