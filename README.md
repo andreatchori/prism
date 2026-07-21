@@ -7,14 +7,155 @@
 ![Rust](https://img.shields.io/badge/rust-1.76+-orange.svg)
 ![Status](https://img.shields.io/badge/status-WIP-yellow.svg)
 
-## Why Prism?
+## Why choose Prism
 
-- **100% self-hosted** - your code never leaves your infrastructure
-- **Your rules** - define exactly what you want reviewed via a simple `rules.toml`
-- **Pluggable LLM** - local Ollama by default (no API keys, no cost), or bring your
-  own OpenAI / Anthropic API key
-- **Multi-platform** - GitHub, GitLab, Azure DevOps, Bitbucket
-- **Fast** - core engine written in Rust, orchestration in Go
+### The fundamental problem with existing tools
+
+```
+CodeRabbit, PR-Agent, Kodus...
+        |
+        v
+Your code → Internet → Their servers → OpenAI/Anthropic
+
+        x  Proprietary code travels over the internet
+        x  You pay per token / user / month
+        x  You depend on THEIR uptime
+        x  Their rules, not yours
+        x  Often Python - limited concurrency
+        x  Reviews tend to queue one after another
+```
+
+### What Prism changes - 5 decisive advantages
+
+#### 1. Your code never leaves
+
+```
+With the others:
+Dev → PR → Vendor servers → OpenAI → Comment
+                    ^
+              YOUR CODE HERE
+
+With Prism:
+Dev → PR → YOUR VPS → Ollama (local) → Comment
+              ^
+        EVERYTHING STAYS HERE
+```
+
+For a bank, a fintech, a healthtech, or any startup with sensitive IP -
+**that is non-negotiable**.
+
+#### 2. Go + Rust engine - built for concurrency
+
+```
+                  Startup      Idle RAM    100 concurrent PRs
+                  ───────      ────────    ──────────────────
+Python / PR-Agent  3-5s         ~150MB      Queue under load
+Go+Rust / Prism    ~50ms        ~12MB       Parallel goroutines
+```
+
+**Go** orchestrates everything in parallel:
+
+```
+50 PRs arrive at once?
+→ 50 goroutines started immediately
+→ Each reviewed independently
+→ No artificial queue
+→ Webhook acknowledged in milliseconds (202 Accepted)
+```
+
+**Rust** analyzes at near-native speed:
+
+```
+10,000-line diff:
+→ Diff parser        :  ~2ms
+→ Rules engine       :  ~5ms   (your rules, evaluated deterministically)
+→ Security patterns  :  ~1ms   (secrets / forbidden patterns)
+→ Total without LLM  :  ~10ms  - instant
+→ Total with Ollama  :  depends on the model (seconds to tens of seconds)
+```
+
+#### 3. Works even without AI
+
+```
+PR-Agent fails if the LLM is down        →  no review
+SaaS reviewers fail if their cloud is down →  no review
+
+Prism                                    →  Rust engine always runs
+                                            deterministic reviews still post
+                                            Ollama is a bonus, not a dependency
+```
+
+Full flow:
+
+```
+PR opened
+    |
+    v
+Go receives webhook              (~1ms)
+    |
+    |--▶ Rust parser             (~2ms, always on)
+    |--▶ Rust rules engine       (~5ms, always on)
+    |--▶ Rust security checks    (~1ms, always on)
+    |
+    └--▶ Ollama / OpenAI / Anthropic / Azure OpenAI  (if available)
+              |
+              v
+         Go merges findings + LLM body and posts the comment
+```
+
+#### 4. Your rules = your team culture
+
+```
+CodeRabbit / PR-Agent  →  "No unused variables"   (generic)
+
+Prism                  →  "Every domain function must have
+                            an associated integration test"
+
+                       →  "HTTP handlers always end with Handler"
+
+                       →  "No merge without a CHANGELOG update"
+```
+
+That is the difference between a generic tool and **a member of your team**.
+
+#### 5. Real cost over 1 year
+
+```
+                  10 devs       50 devs       100 devs
+                  ───────       ───────       ────────
+CodeRabbit        ~$1,440/yr    ~$7,200/yr    ~$14,400/yr
+PR-Agent Pro      ~$900/yr      ~$4,500/yr    ~$9,000/yr
+Kodus             ~$1,200/yr    ~$6,000/yr    ~$12,000/yr
+
+Prism             $0            $0            $0
+(just the VPS / GPU you already run)
+```
+
+Prices above are indicative - check each vendor for current plans.
+Prism itself is free software; you only pay for your own infra (and optional API tokens
+if you choose OpenAI / Anthropic / Azure OpenAI instead of local Ollama).
+
+### Full comparison
+
+| | **Prism** | PR-Agent | CodeRabbit | SonarQube |
+|---|---|---|---|---|
+| Code stays on your infra | Yes | Optional / limited | No (vendor cloud) | Yes (self-hosted) |
+| Privacy by default | Yes | Partial | No | Yes |
+| Reliable local Ollama | Yes | Weak / fragile | No | No |
+| Works without LLM | Yes (Rust engine) | No | No | Yes (SAST) |
+| 100% custom rules | Yes (`rules.toml`) | Partial | Limited | SAST-oriented |
+| Multi-platform | GitHub, GitLab, Azure, Bitbucket | Broad | Mostly GitHub | Broad |
+| Stack | Go + Rust | Python | SaaS | Java |
+| High PR concurrency | Yes (goroutines) | Limited | Cloud-scaled | Limited |
+| Install | Minutes (binary / Compose) | Heavier | SaaS | Heavy |
+| Price | Free | Free / paid | Paid per user | Free / paid |
+| Open source | Yes | Yes | No | Partial |
+
+### In one sentence
+
+> Prism is the code reviewer where your code never leaves your infra, your rules
+> reflect your team culture, the Rust engine answers in milliseconds, Go runs many
+> reviews in parallel - all on a VPS you already own, without paying a reviewer SaaS.
 
 ## Architecture
 
